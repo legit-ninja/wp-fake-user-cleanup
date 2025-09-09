@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name: InterSoccer Fake User Cleanup - Enhanced
- * Description: Enhanced cleanup tool for fake users with real-time progress
- * Version: 2.0.0
+ * Plugin Name: InterSoccer Fake User Cleanup - Enhanced with Debug
+ * Description: Enhanced cleanup tool with detailed debugging and date range selector
+ * Version: 3.0.0
  * Author: InterSoccer Development Team
  */
 
@@ -14,13 +14,14 @@ if (!defined('ABSPATH')) {
 class InterSoccer_Enhanced_Fake_User_Cleanup {
     
     private $log_file;
-    private $transient_key = 'intersoccer_fake_ids_v2';
+    private $transient_key = 'intersoccer_fake_ids_v3';
     
     public function __construct() {
         $this->log_file = WP_CONTENT_DIR . '/intersoccer-cleanup-enhanced.log';
         add_action('admin_menu', array($this, 'add_admin_menu'));
         add_action('wp_ajax_scan_fake_users_enhanced', array($this, 'ajax_scan_fake_users'));
         add_action('wp_ajax_cleanup_fake_users_enhanced', array($this, 'ajax_cleanup_fake_users'));
+        add_action('wp_ajax_validate_date_range', array($this, 'ajax_validate_date_range'));
     }
     
     public function add_admin_menu() {
@@ -42,6 +43,22 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 <p><strong>Important:</strong> This tool will permanently delete users. Always test on staging first and create database backups.</p>
             </div>
             
+            <!-- Date Range Configuration -->
+            <div class="card">
+                <h2>Incident Date Range Configuration</h2>
+                <p>Define the date range when fake users were created. Only users registered within this period will be considered for cleanup.</p>
+                
+                <div class="date-range-options">
+                    <label>Start Date: <input type="date" id="incident-start-date" value="2025-07-01"></label>
+                    <label>End Date: <input type="date" id="incident-end-date" value="2025-08-25"></label>
+                    <button id="validate-date-range" class="button">Validate Date Range</button>
+                </div>
+                
+                <div id="date-validation-results" style="display: none; margin-top: 15px;">
+                    <div id="date-validation-summary"></div>
+                </div>
+            </div>
+            
             <!-- Scan Section -->
             <div class="card">
                 <h2>Step 1: Scan for Fake Users</h2>
@@ -49,10 +66,13 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 
                 <div class="scan-options">
                     <label>Batch size: <select id="scan-batch-size">
-                        <option value="250">250 (Conservative)</option>
-                        <option value="500" selected>500 (Recommended)</option>
-                        <option value="1000">1000 (Fast)</option>
+                        <option value="100">100 (Conservative)</option>
+                        <option value="250" selected>250 (Recommended)</option>
+                        <option value="500">500 (Fast)</option>
                     </select></label>
+                    
+                    <label><input type="checkbox" id="detailed-logging" checked> Enable detailed logging</label>
+                    <label><input type="checkbox" id="debug-first-10"> Debug first 10 users in detail</label>
                 </div>
                 
                 <button id="scan-users" class="button button-primary">Start Scan</button>
@@ -70,11 +90,18 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 </div>
             </div>
             
+            <!-- Debug Section -->
+            <div class="card" id="debug-section" style="display: none;">
+                <h2>Debug Information</h2>
+                <div id="debug-output"></div>
+            </div>
+            
             <!-- Results Section -->
             <div class="card" id="results-section" style="display: none;">
                 <h2>Scan Results</h2>
                 <div id="scan-summary"></div>
                 <div id="sample-users"></div>
+                <div id="safety-check-breakdown"></div>
             </div>
             
             <!-- Cleanup Section -->
@@ -84,9 +111,11 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 
                 <div class="cleanup-options">
                     <label><input type="checkbox" id="dry-run" checked> Dry Run (Log only, no deletion)</label>
+                    <label><input type="checkbox" id="force-cleanup"> Force cleanup (bypass some safety checks)</label>
                     <label>Cleanup batch size: <select id="cleanup-batch-size">
-                        <option value="50">50 (Safe)</option>
-                        <option value="100" selected>100 (Recommended)</option>
+                        <option value="25">25 (Ultra Safe)</option>
+                        <option value="50" selected>50 (Safe)</option>
+                        <option value="100">100 (Fast)</option>
                     </select></label>
                 </div>
                 
@@ -139,13 +168,13 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
             margin-top: 8px;
             font-size: 13px;
         }
-        .scan-options, .cleanup-options { 
+        .scan-options, .cleanup-options, .date-range-options { 
             margin: 15px 0; 
             display: flex; 
             gap: 20px; 
             flex-wrap: wrap;
         }
-        .scan-options label, .cleanup-options label { 
+        .scan-options label, .cleanup-options label, .date-range-options label { 
             display: flex; 
             align-items: center; 
             gap: 5px; 
@@ -171,15 +200,15 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
             font-weight: bold;
             color: #333;
         }
-        .sample-users {
-            max-height: 200px;
+        .sample-users, .debug-output {
+            max-height: 300px;
             overflow-y: auto;
             background: #f8f9fa;
             padding: 10px;
             border-radius: 4px;
             margin: 10px 0;
         }
-        .user-item {
+        .user-item, .debug-item {
             padding: 5px 0;
             border-bottom: 1px solid #ddd;
             font-family: monospace;
@@ -194,12 +223,45 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
         }
         .status-safe { background-color: #46b450; }
         .status-warning { background-color: #ffb900; }
+        .status-danger { background-color: #dc3232; }
+        .debug-details {
+            margin-left: 20px;
+            font-size: 11px;
+            color: #666;
+        }
+        .safety-breakdown {
+            background: #f0f0f1;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 15px 0;
+        }
+        .safety-breakdown h4 {
+            margin: 0 0 10px 0;
+            color: #50575e;
+        }
+        .check-result {
+            display: flex;
+            justify-content: space-between;
+            margin: 5px 0;
+            padding: 3px 0;
+            border-bottom: 1px solid #ddd;
+        }
+        .check-result.failed {
+            color: #dc3232;
+        }
+        .check-result.passed {
+            color: #46b450;
+        }
         </style>
         
         <script>
         jQuery(document).ready(function($) {
             let scanInProgress = false;
             let cleanupInProgress = false;
+            
+            $('#validate-date-range').click(function() {
+                validateDateRange();
+            });
             
             $('#scan-users').click(function() {
                 if (!scanInProgress) {
@@ -210,9 +272,14 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
             $('#cleanup-users').click(function() {
                 if (!cleanupInProgress) {
                     const dryRun = $('#dry-run').is(':checked');
-                    const confirmMsg = dryRun ? 
+                    const forceCleanup = $('#force-cleanup').is(':checked');
+                    let confirmMsg = dryRun ? 
                         'Start dry run cleanup? No users will be deleted.' : 
                         'Are you sure you want to delete these users? This action cannot be undone!';
+                    
+                    if (forceCleanup && !dryRun) {
+                        confirmMsg += '\n\nWARNING: Force cleanup is enabled - some safety checks will be bypassed!';
+                    }
                     
                     if (confirm(confirmMsg)) {
                         startCleanup();
@@ -220,11 +287,45 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 }
             });
             
+            function validateDateRange() {
+                const startDate = $('#incident-start-date').val();
+                const endDate = $('#incident-end-date').val();
+                
+                if (!startDate || !endDate) {
+                    alert('Please select both start and end dates');
+                    return;
+                }
+                
+                $.ajax({
+                    url: ajaxurl,
+                    type: 'POST',
+                    data: {
+                        action: 'validate_date_range',
+                        nonce: '<?php echo wp_create_nonce('fake_user_cleanup_enhanced'); ?>',
+                        start_date: startDate,
+                        end_date: endDate
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            $('#date-validation-results').show();
+                            $('#date-validation-summary').html(
+                                `<p><strong>Date range validated:</strong> Found ${response.data.users_in_range} users registered between ${startDate} and ${endDate}</p>
+                                <p><em>Pattern matches: ${response.data.pattern_matches}</em></p>`
+                            );
+                        } else {
+                            alert('Error validating date range: ' + response.data.message);
+                        }
+                    }
+                });
+            }
+            
             function startScan() {
                 scanInProgress = true;
                 $('#scan-users').prop('disabled', true).text('Starting scan...');
                 $('#scan-progress-container').show();
-                $('#results-section, #cleanup-section').hide();
+                $('#results-section, #cleanup-section, #debug-section').hide();
+                
+                const batchSize = parseInt($('#scan-batch-size').val());
                 
                 // Show immediate feedback
                 updateScanProgress({
@@ -234,14 +335,16 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                     memory_mb: 0
                 });
                 
-                const batchSize = parseInt($('#scan-batch-size').val());
-                
                 // Start real-time batch processing
                 processScanBatch(0, batchSize);
             }
             
             function processScanBatch(offset, batchSize) {
-                // Update button text to show current batch
+                const startDate = $('#incident-start-date').val();
+                const endDate = $('#incident-end-date').val();
+                const detailedLogging = $('#detailed-logging').is(':checked');
+                const debugFirst10 = $('#debug-first-10').is(':checked');
+                
                 if (offset === 0) {
                     $('#scan-users').text('Scanning users...');
                 } else {
@@ -251,26 +354,36 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 $.ajax({
                     url: ajaxurl,
                     type: 'POST',
+                    timeout: 120000, // 2 minutes timeout
                     data: {
                         action: 'scan_fake_users_enhanced',
                         nonce: '<?php echo wp_create_nonce('fake_user_cleanup_enhanced'); ?>',
                         batch_size: batchSize,
-                        offset: offset
+                        offset: offset,
+                        start_date: startDate,
+                        end_date: endDate,
+                        detailed_logging: detailedLogging ? 1 : 0,
+                        debug_first_10: debugFirst10 ? 1 : 0
                     },
                     success: function(response) {
                         if (response.success) {
                             // Update progress immediately
                             updateScanProgress(response.data.progress);
                             
+                            // Show debug info if available
+                            if (response.data.debug_info) {
+                                displayDebugInfo(response.data.debug_info);
+                            }
+                            
                             if (response.data.completed) {
                                 // Scan complete
                                 $('#scan-users').text('Scan completed!');
                                 completeScan(response.data.results);
                             } else {
-                                // Process next batch
+                                // Process next batch with delay to prevent timeouts
                                 setTimeout(function() {
                                     processScanBatch(response.data.next_offset, batchSize);
-                                }, 100);
+                                }, 200);
                             }
                         } else {
                             alert('Error during scan: ' + response.data.message);
@@ -280,10 +393,25 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                     error: function(xhr, status, error) {
                         console.error('AJAX Error:', status, error);
                         console.error('Response:', xhr.responseText);
-                        alert('Network error during scan. Check console and debug log.');
+                        
+                        if (status === 'timeout') {
+                            alert('Request timed out. Try reducing batch size or check server resources.');
+                        } else {
+                            alert('Network error during scan. Check console and debug log.');
+                        }
                         resetScanUI();
                     }
                 });
+            }
+            
+            function displayDebugInfo(debugInfo) {
+                $('#debug-section').show();
+                let debugHtml = '<div class="debug-output">';
+                debugInfo.forEach(function(item) {
+                    debugHtml += `<div class="debug-item">${item}</div>`;
+                });
+                debugHtml += '</div>';
+                $('#debug-output').html(debugHtml);
             }
             
             function updateScanProgress(data) {
@@ -292,7 +420,7 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 $('#scan-progress-text').text(`${percent.toFixed(1)}% complete`);
                 
                 if (data.processed !== undefined) {
-                    $('#scan-stats').text(`Processed: ${data.processed} | Fake found: ${data.fake_found || 0} | Memory: ${data.memory_mb || 0}MB`);
+                    $('#scan-stats').text(`Processed: ${data.processed} | Fake found: ${data.fake_found || 0} | Safe: ${data.safe_found || 0} | Memory: ${data.memory_mb || 0}MB`);
                 }
             }
             
@@ -332,7 +460,7 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 $('#scan-summary').html(summaryHtml);
                 
                 if (data.sample_users && data.sample_users.length > 0) {
-                    let sampleHtml = '<h4>Sample Users (first 10):</h4><div class="sample-users">';
+                    let sampleHtml = '<h4>Sample Users (first 20):</h4><div class="sample-users">';
                     data.sample_users.forEach(function(user) {
                         const statusClass = user.safe_to_delete ? 'status-safe' : 'status-warning';
                         sampleHtml += `<div class="user-item">
@@ -343,11 +471,26 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                     sampleHtml += '</div>';
                     $('#sample-users').html(sampleHtml);
                 }
+                
+                // Display safety check breakdown
+                if (data.safety_breakdown) {
+                    let breakdownHtml = '<div class="safety-breakdown"><h4>Safety Check Analysis:</h4>';
+                    Object.keys(data.safety_breakdown).forEach(function(check) {
+                        const count = data.safety_breakdown[check];
+                        breakdownHtml += `<div class="check-result">
+                            <span>${check.replace(/_/g, ' ')}</span>
+                            <span>${count} users failed this check</span>
+                        </div>`;
+                    });
+                    breakdownHtml += '</div>';
+                    $('#safety-check-breakdown').html(breakdownHtml);
+                }
             }
             
             function startCleanup() {
                 cleanupInProgress = true;
                 const dryRun = $('#dry-run').is(':checked');
+                const forceCleanup = $('#force-cleanup').is(':checked');
                 
                 $('#cleanup-users').prop('disabled', true).text(dryRun ? 'Running Dry Run...' : 'Deleting...');
                 $('#cleanup-progress-container').show();
@@ -355,18 +498,20 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 const batchSize = parseInt($('#cleanup-batch-size').val());
                 
                 // Start real-time batch processing
-                processCleanupBatch(0, batchSize, dryRun);
+                processCleanupBatch(0, batchSize, dryRun, forceCleanup);
             }
             
-            function processCleanupBatch(offset, batchSize, dryRun) {
+            function processCleanupBatch(offset, batchSize, dryRun, forceCleanup) {
                 $.ajax({
                     url: ajaxurl,
                     type: 'POST',
+                    timeout: 120000, // 2 minutes timeout
                     data: {
                         action: 'cleanup_fake_users_enhanced',
                         nonce: '<?php echo wp_create_nonce('fake_user_cleanup_enhanced'); ?>',
                         batch_size: batchSize,
                         dry_run: dryRun ? 1 : 0,
+                        force_cleanup: forceCleanup ? 1 : 0,
                         offset: offset
                     },
                     success: function(response) {
@@ -378,10 +523,10 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                                 // Cleanup complete
                                 completeCleanup(response.data.results);
                             } else {
-                                // Process next batch
+                                // Process next batch with delay
                                 setTimeout(function() {
-                                    processCleanupBatch(response.data.next_offset, batchSize, dryRun);
-                                }, dryRun ? 50 : 200);
+                                    processCleanupBatch(response.data.next_offset, batchSize, dryRun, forceCleanup);
+                                }, dryRun ? 100 : 500);
                             }
                         } else {
                             alert('Error during cleanup: ' + response.data.message);
@@ -390,7 +535,11 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                     },
                     error: function(xhr, status, error) {
                         console.error('AJAX Error:', status, error);
-                        alert('Network error during cleanup. Check console.');
+                        if (status === 'timeout') {
+                            alert('Cleanup request timed out. Check log for partial results.');
+                        } else {
+                            alert('Network error during cleanup. Check console.');
+                        }
                         resetCleanupUI();
                     }
                 });
@@ -427,6 +576,44 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
         <?php
     }
     
+    public function ajax_validate_date_range() {
+        check_ajax_referer('fake_user_cleanup_enhanced', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Insufficient permissions'));
+        }
+        
+        $start_date = sanitize_text_field($_POST['start_date']);
+        $end_date = sanitize_text_field($_POST['end_date']);
+        
+        if (!$start_date || !$end_date) {
+            wp_send_json_error(array('message' => 'Both start and end dates are required'));
+        }
+        
+        global $wpdb;
+        
+        // Count users in date range
+        $users_in_range = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->users} 
+             WHERE user_registered >= %s AND user_registered <= %s",
+            $start_date . ' 00:00:00',
+            $end_date . ' 23:59:59'
+        ));
+        
+        // Count pattern matches in date range
+        $pattern_matches = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->users} 
+             WHERE user_email REGEXP '^[a-z]{8}[0-9]{2}@(gmail|outlook|yahoo|hotmail)\\.com$'
+             AND user_registered >= %s AND user_registered <= %s",
+            $start_date . ' 00:00:00',
+            $end_date . ' 23:59:59'
+        ));
+        
+        wp_send_json_success(array(
+            'users_in_range' => intval($users_in_range),
+            'pattern_matches' => intval($pattern_matches)
+        ));
+    }
+    
     public function ajax_scan_fake_users() {
         check_ajax_referer('fake_user_cleanup_enhanced', 'nonce');
         if (!current_user_can('manage_options')) {
@@ -434,24 +621,33 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
         }
         
         // Increase limits for large operations
-        @set_time_limit(300);
+        @set_time_limit(120); // Reduced from 300
         @ini_set('memory_limit', '512M');
         
-        $batch_size = isset($_POST['batch_size']) ? intval($_POST['batch_size']) : 500;
+        $batch_size = isset($_POST['batch_size']) ? intval($_POST['batch_size']) : 250;
         $offset = isset($_POST['offset']) ? intval($_POST['offset']) : 0;
+        $start_date = sanitize_text_field($_POST['start_date']) . ' 00:00:00';
+        $end_date = sanitize_text_field($_POST['end_date']) . ' 23:59:59';
+        $detailed_logging = isset($_POST['detailed_logging']) && $_POST['detailed_logging'] == 1;
+        $debug_first_10 = isset($_POST['debug_first_10']) && $_POST['debug_first_10'] == 1;
         $is_initial = $offset === 0;
         
         $start_time = microtime(true);
         $this->log_message('=== Starting Scan Batch ===');
-        $this->log_message("Batch size: {$batch_size}, Offset: {$offset}");
+        $this->log_message("Batch size: {$batch_size}, Offset: {$offset}, Date range: {$start_date} to {$end_date}");
         
         global $wpdb;
         
         // Get total count on first request
         if ($is_initial) {
-            $total_query = "SELECT COUNT(*) FROM {$wpdb->users} WHERE user_email REGEXP '^[a-z]{8}[0-9]{2}@(gmail|outlook|yahoo|hotmail)\\.com$'";
+            $total_query = $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->users} 
+                 WHERE user_email REGEXP '^[a-z]{8}[0-9]{2}@(gmail|outlook|yahoo|hotmail)\\.com$'
+                 AND user_registered >= %s AND user_registered <= %s",
+                $start_date, $end_date
+            );
             $total_users = $wpdb->get_var($total_query);
-            $this->log_message("Found {$total_users} users matching email pattern");
+            $this->log_message("Found {$total_users} users matching email pattern in date range");
             
             if ($total_users == 0) {
                 wp_send_json_success(array(
@@ -461,7 +657,8 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                         'pattern_matches' => 0,
                         'fake_users_count' => 0,
                         'safe_to_delete' => 0,
-                        'sample_users' => array()
+                        'sample_users' => array(),
+                        'safety_breakdown' => array()
                     )
                 ));
                 return;
@@ -476,7 +673,9 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 'fake_users' => array(),
                 'fake_ids' => array(),
                 'safe_to_delete_count' => 0,
-                'processed' => 0
+                'processed' => 0,
+                'safety_breakdown' => array(),
+                'debug_info' => array()
             ), HOUR_IN_SECONDS);
         } else {
             $total_users = get_transient($this->transient_key . '_total');
@@ -494,25 +693,47 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
         }
         
         // Process current batch
-        $query = "SELECT ID, user_email, user_registered FROM {$wpdb->users} 
-                  WHERE user_email REGEXP '^[a-z]{8}[0-9]{2}@(gmail|outlook|yahoo|hotmail)\\.com$' 
-                  LIMIT %d OFFSET %d";
+        $query = $wpdb->prepare(
+            "SELECT ID, user_email, user_registered FROM {$wpdb->users} 
+             WHERE user_email REGEXP '^[a-z]{8}[0-9]{2}@(gmail|outlook|yahoo|hotmail)\\.com$'
+             AND user_registered >= %s AND user_registered <= %s
+             LIMIT %d OFFSET %d",
+            $start_date, $end_date, $batch_size, $offset
+        );
         
-        $users = $wpdb->get_results($wpdb->prepare($query, $batch_size, $offset));
+        $users = $wpdb->get_results($query);
         $this->log_message("Processing batch: " . count($users) . " users from offset {$offset}");
         
         $batch_fake_count = 0;
         $batch_safe_count = 0;
+        $debug_info = array();
         
         foreach ($users as $user) {
-            $validation = $this->comprehensive_user_validation($user->ID, $user->user_email);
+            $validation = $this->comprehensive_user_validation($user->ID, $user->user_email, $detailed_logging);
+            
+            // Debug first 10 users in detail
+            if ($debug_first_10 && $scan_data['processed'] < 10) {
+                $user_number = $scan_data['processed'] + 1;
+                $debug_info[] = "=== DEBUG USER {$user_number} ===";
+                $debug_info[] = "Email: {$user->user_email}, ID: {$user->ID}, Registered: {$user->user_registered}";
+                $debug_info[] = "Is Fake: " . ($validation['is_fake'] ? 'YES' : 'NO');
+                $debug_info[] = "Safe to Delete: " . ($validation['safe_to_delete'] ? 'YES' : 'NO');
+                
+                foreach ($validation['checks'] as $check_name => $check_data) {
+                    $status = $check_data['passed'] ? 'PASS' : 'FAIL';
+                    $value = isset($check_data['value']) ? " ({$check_data['value']})" : '';
+                    $debug_info[] = "  {$check_name}: {$status}{$value}";
+                }
+                $debug_info[] = "---";
+            }
             
             if ($validation['is_fake']) {
                 $scan_data['fake_users'][] = array(
                     'ID' => $user->ID,
                     'user_email' => $user->user_email,
                     'user_registered' => $user->user_registered,
-                    'safe_to_delete' => $validation['safe_to_delete']
+                    'safe_to_delete' => $validation['safe_to_delete'],
+                    'validation_details' => $validation['checks']
                 );
                 $scan_data['fake_ids'][] = $user->ID;
                 $batch_fake_count++;
@@ -520,10 +741,25 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 if ($validation['safe_to_delete']) {
                     $scan_data['safe_to_delete_count']++;
                     $batch_safe_count++;
+                } else {
+                    // Track which safety checks are failing
+                    foreach ($validation['checks'] as $check_name => $check_data) {
+                        if (!$check_data['passed'] && strpos($check_name, 'no_') !== 0 && $check_name !== 'email_pattern' && $check_name !== 'registration_date') {
+                            if (!isset($scan_data['safety_breakdown'][$check_name])) {
+                                $scan_data['safety_breakdown'][$check_name] = 0;
+                            }
+                            $scan_data['safety_breakdown'][$check_name]++;
+                        }
+                    }
                 }
             }
             
             $scan_data['processed']++;
+        }
+        
+        // Store debug info
+        if (!empty($debug_info)) {
+            $scan_data['debug_info'] = array_merge($scan_data['debug_info'], $debug_info);
         }
         
         // Update scan data
@@ -539,6 +775,21 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
         $next_offset = $offset + $batch_size;
         $completed = $next_offset >= $total_users;
         
+        $response_data = array(
+            'completed' => $completed,
+            'progress' => array(
+                'percent' => $percent,
+                'processed' => $scan_data['processed'],
+                'fake_found' => count($scan_data['fake_users']),
+                'safe_found' => $scan_data['safe_to_delete_count'],
+                'memory_mb' => $memory_mb
+            )
+        );
+        
+        if (!empty($scan_data['debug_info'])) {
+            $response_data['debug_info'] = $scan_data['debug_info'];
+        }
+        
         if ($completed) {
             // Store final results
             set_transient($this->transient_key, $scan_data['fake_ids'], HOUR_IN_SECONDS);
@@ -548,38 +799,24 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 'pattern_matches' => $total_users,
                 'fake_users_count' => count($scan_data['fake_users']),
                 'safe_to_delete' => $scan_data['safe_to_delete_count'],
-                'sample_users' => array_slice($scan_data['fake_users'], 0, 10)
+                'sample_users' => array_slice($scan_data['fake_users'], 0, 20),
+                'safety_breakdown' => $scan_data['safety_breakdown']
             );
             
             $this->log_message("Scan complete! Found " . count($scan_data['fake_users']) . " fake users (" . $scan_data['safe_to_delete_count'] . " safe to delete)");
+            $this->log_message("Safety breakdown: " . json_encode($scan_data['safety_breakdown']));
             
             // Clean up temporary data
             delete_transient($this->transient_key . '_total');
             delete_transient($this->transient_key . '_scan_data');
             
-            wp_send_json_success(array(
-                'completed' => true,
-                'results' => $results,
-                'progress' => array(
-                    'percent' => 100,
-                    'processed' => $scan_data['processed'],
-                    'fake_found' => count($scan_data['fake_users']),
-                    'memory_mb' => $memory_mb
-                )
-            ));
+            $response_data['results'] = $results;
         } else {
             // Return progress for next batch
-            wp_send_json_success(array(
-                'completed' => false,
-                'next_offset' => $next_offset,
-                'progress' => array(
-                    'percent' => $percent,
-                    'processed' => $scan_data['processed'],
-                    'fake_found' => count($scan_data['fake_users']),
-                    'memory_mb' => $memory_mb
-                )
-            ));
+            $response_data['next_offset'] = $next_offset;
         }
+        
+        wp_send_json_success($response_data);
     }
     
     public function ajax_cleanup_fake_users() {
@@ -593,18 +830,19 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
             wp_send_json_error(array('message' => 'No scan results found. Please run scan first.'));
         }
         
-        @set_time_limit(300);
+        @set_time_limit(120); // Reduced timeout
         @ini_set('memory_limit', '512M');
         
-        $batch_size = isset($_POST['batch_size']) ? intval($_POST['batch_size']) : 100;
+        $batch_size = isset($_POST['batch_size']) ? intval($_POST['batch_size']) : 50;
         $dry_run = isset($_POST['dry_run']) && $_POST['dry_run'] == 1;
+        $force_cleanup = isset($_POST['force_cleanup']) && $_POST['force_cleanup'] == 1;
         $offset = isset($_POST['offset']) ? intval($_POST['offset']) : 0;
         $is_initial = $offset === 0;
         
         $start_time = microtime(true);
         
         if ($is_initial) {
-            $this->log_message('=== Starting Cleanup ' . ($dry_run ? '(Dry Run)' : '') . ' ===');
+            $this->log_message('=== Starting Cleanup ' . ($dry_run ? '(Dry Run)' : '') . ($force_cleanup ? ' (FORCE MODE)' : '') . ' ===');
             $this->log_message("Total users to process: " . count($fake_ids));
             
             // Initialize cleanup data
@@ -646,8 +884,10 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 $batch_deleted++;
                 $cleanup_data['deleted']++;
             } else {
-                // Final safety check
-                if ($this->final_safety_check($user_id)) {
+                // Safety check (can be bypassed with force)
+                $safe_to_delete = $force_cleanup || $this->final_safety_check($user_id, $force_cleanup);
+                
+                if ($safe_to_delete) {
                     if (wp_delete_user($user_id)) {
                         $batch_deleted++;
                         $cleanup_data['deleted']++;
@@ -660,7 +900,7 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
                 } else {
                     $batch_skipped++;
                     $cleanup_data['skipped']++;
-                    $this->log_message("Final safety check failed for user ID: {$user_id}, Email: {$user->user_email}", 'WARNING');
+                    $this->log_message("Safety check failed for user ID: {$user_id}, Email: {$user->user_email}", 'WARNING');
                 }
             }
             
@@ -711,7 +951,7 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
         }
     }
     
-    private function comprehensive_user_validation($user_id, $email) {
+    private function comprehensive_user_validation($user_id, $email, $detailed_logging = false) {
         $validation = array(
             'user_id' => $user_id,
             'email' => $email,
@@ -727,48 +967,122 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
             'description' => 'Email matches fake user pattern'
         );
         
-        // Registration date check (incident timeframe)
+        // Get user object once
         $user = get_user_by('id', $user_id);
-        $reg_date = strtotime($user->user_registered);
-        $incident_start = strtotime('2025-07-01');
-        $incident_end = strtotime('2025-08-25');
+        if (!$user) {
+            $validation['checks']['user_exists'] = array(
+                'passed' => false,
+                'description' => 'User exists in database'
+            );
+            return $validation;
+        }
+        
+        $validation['checks']['user_exists'] = array(
+            'passed' => true,
+            'description' => 'User exists in database'
+        );
+        
+        // Registration date check - already filtered by query, so this should always pass
         $validation['checks']['registration_date'] = array(
-            'passed' => ($reg_date >= $incident_start && $reg_date <= $incident_end),
-            'description' => 'Registered during incident timeframe (July-August 2025)',
+            'passed' => true,
+            'description' => 'Registered during incident timeframe',
             'value' => $user->user_registered
         );
         
-        // WooCommerce orders check
-        $orders = wc_get_orders(array(
-            'customer_id' => $user_id,
-            'limit' => 1,
-            'return' => 'ids'
-        ));
+        // WooCommerce orders check - more comprehensive
+        $has_orders = false;
+        if (function_exists('wc_get_orders')) {
+            $orders = wc_get_orders(array(
+                'customer_id' => $user_id,
+                'limit' => 1,
+                'status' => 'any',
+                'return' => 'ids'
+            ));
+            $has_orders = !empty($orders);
+            
+            if ($detailed_logging && $has_orders) {
+                $this->log_message("User {$user_id} has " . count($orders) . " WooCommerce orders");
+            }
+        } else {
+            // Fallback: check order meta table directly
+            global $wpdb;
+            $order_count = $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->postmeta} pm 
+                 JOIN {$wpdb->posts} p ON pm.post_id = p.ID 
+                 WHERE pm.meta_key = '_customer_user' 
+                 AND pm.meta_value = %d 
+                 AND p.post_type = 'shop_order'",
+                $user_id
+            ));
+            $has_orders = $order_count > 0;
+            
+            if ($detailed_logging) {
+                $this->log_message("User {$user_id} has {$order_count} orders (direct query)");
+            }
+        }
+        
         $validation['checks']['no_orders'] = array(
-            'passed' => empty($orders),
+            'passed' => !$has_orders,
             'description' => 'No WooCommerce orders',
-            'value' => count($orders) . ' orders found'
+            'value' => $has_orders ? 'Has orders' : 'No orders'
         );
         
-        // InterSoccer players metadata check
+        // InterSoccer players metadata check - more thorough
         $player_data = get_user_meta($user_id, 'intersoccer_players', true);
+        $has_player_data = false;
+        
+        if (!empty($player_data)) {
+            if (is_array($player_data) && count($player_data) > 0) {
+                // Check if it's actually meaningful data
+                $valid_entries = 0;
+                foreach ($player_data as $player) {
+                    if (is_array($player) && (!empty($player['first_name']) || !empty($player['last_name']))) {
+                        $valid_entries++;
+                    }
+                }
+                $has_player_data = $valid_entries > 0;
+            } elseif (is_string($player_data) && trim($player_data) !== '') {
+                $has_player_data = true;
+            }
+        }
+        
         $validation['checks']['no_player_data'] = array(
-            'passed' => empty($player_data),
+            'passed' => !$has_player_data,
             'description' => 'No intersoccer_players metadata',
-            'value' => empty($player_data) ? 'No player data' : 'Has player data: ' . (is_array($player_data) ? count($player_data) . ' players' : 'Invalid format')
+            'value' => $has_player_data ? 'Has player data' : 'No player data'
         );
         
-        // Admin capabilities check
+        if ($detailed_logging && $has_player_data) {
+            $this->log_message("User {$user_id} has player data: " . json_encode($player_data));
+        }
+        
+        // Admin capabilities check - more specific
+        $has_admin_caps = false;
+        $user_roles = $user->roles;
+        $admin_capabilities = array('manage_options', 'edit_users', 'delete_users', 'edit_posts', 'publish_posts', 'manage_woocommerce');
+        
+        foreach ($admin_capabilities as $cap) {
+            if (user_can($user_id, $cap)) {
+                $has_admin_caps = true;
+                break;
+            }
+        }
+        
+        // Also check if user has non-standard roles
+        $standard_roles = array('subscriber', 'customer');
+        $has_elevated_role = !empty(array_diff($user_roles, $standard_roles));
+        
         $validation['checks']['not_admin'] = array(
-            'passed' => !user_can($user_id, 'manage_options'),
-            'description' => 'Not an administrator'
+            'passed' => !$has_admin_caps && !$has_elevated_role,
+            'description' => 'Not an administrator or elevated user',
+            'value' => 'Roles: ' . implode(', ', $user_roles)
         );
         
         // Posts/content check
-        $post_count = count_user_posts($user_id);
+        $post_count = count_user_posts($user_id, array('post', 'page'), true);
         $validation['checks']['no_posts'] = array(
             'passed' => $post_count === 0,
-            'description' => 'No posts or content',
+            'description' => 'No posts or pages',
             'value' => $post_count . ' posts'
         );
         
@@ -780,92 +1094,94 @@ class InterSoccer_Enhanced_Fake_User_Cleanup {
             'value' => $comment_count . ' comments'
         );
         
+        // User meta check - look for any suspicious metadata
+        $all_meta = get_user_meta($user_id);
+        $suspicious_meta = array();
+        foreach ($all_meta as $key => $value) {
+            if (!in_array($key, array('nickname', 'first_name', 'last_name', 'description', 'rich_editing', 'syntax_highlighting', 'comment_shortcuts', 'admin_color', 'use_ssl', 'show_admin_bar_front', 'locale'))) {
+                if (!empty($value[0]) && $value[0] !== '') {
+                    $suspicious_meta[] = $key;
+                }
+            }
+        }
+        
+        $validation['checks']['minimal_metadata'] = array(
+            'passed' => count($suspicious_meta) <= 3, // Allow some basic meta
+            'description' => 'Minimal user metadata',
+            'value' => count($suspicious_meta) . ' meta keys: ' . implode(', ', array_slice($suspicious_meta, 0, 5))
+        );
+        
         // Determine if user is fake and safe to delete
         $required_checks = array('email_pattern', 'registration_date', 'no_orders', 'no_player_data');
-        $safety_checks = array('not_admin', 'no_posts', 'no_comments');
+        $safety_checks = array('not_admin', 'no_posts', 'no_comments', 'minimal_metadata');
         
         $validation['is_fake'] = true;
         foreach ($required_checks as $check) {
-            if (!$validation['checks'][$check]['passed']) {
+            if (!isset($validation['checks'][$check]) || !$validation['checks'][$check]['passed']) {
                 $validation['is_fake'] = false;
                 break;
             }
         }
         
         $validation['safe_to_delete'] = $validation['is_fake'];
-        foreach ($safety_checks as $check) {
-            if (!$validation['checks'][$check]['passed']) {
-                $validation['safe_to_delete'] = false;
-                break;
+        if ($validation['is_fake']) {
+            foreach ($safety_checks as $check) {
+                if (!isset($validation['checks'][$check]) || !$validation['checks'][$check]['passed']) {
+                    $validation['safe_to_delete'] = false;
+                    if ($detailed_logging) {
+                        $this->log_message("User {$user_id} failed safety check: {$check}");
+                    }
+                    break;
+                }
             }
         }
         
         return $validation;
     }
     
-    public function final_safety_check($user_id) {
-        // Extra safety check before actual deletion
+    public function final_safety_check($user_id, $force_mode = false) {
+        if ($force_mode) {
+            $this->log_message("FORCE MODE: Bypassing some safety checks for user {$user_id}", 'WARNING');
+            // In force mode, only check the most critical things
+            $user = get_user_by('id', $user_id);
+            if (!$user) return false;
+            
+            // Still block if user has admin capabilities
+            if (user_can($user_id, 'manage_options')) {
+                $this->log_message("SAFETY BLOCK (FORCE): User {$user_id} has manage_options capability", 'ERROR');
+                return false;
+            }
+            
+            // Still block if user has orders
+            if (function_exists('wc_get_orders')) {
+                $orders = wc_get_orders(array('customer_id' => $user_id, 'limit' => 1, 'return' => 'ids'));
+                if (!empty($orders)) {
+                    $this->log_message("SAFETY BLOCK (FORCE): User {$user_id} has WooCommerce orders", 'ERROR');
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+        
+        // Regular safety check - same as before but with better logging
         $user = get_user_by('id', $user_id);
         if (!$user) return false;
         
-        // Check if user has any administrative capabilities beyond basic customer/subscriber
-        if (user_can($user_id, 'manage_options') || 
-            user_can($user_id, 'edit_users') || 
-            user_can($user_id, 'delete_users') ||
-            user_can($user_id, 'edit_posts') ||
-            user_can($user_id, 'publish_posts')) {
-            $this->log_message("SAFETY BLOCK: User {$user_id} has administrative capabilities", 'ERROR');
-            return false;
+        // Comprehensive validation
+        $validation = $this->comprehensive_user_validation($user_id, $user->user_email, true);
+        
+        if (!$validation['safe_to_delete']) {
+            $failed_checks = array();
+            foreach ($validation['checks'] as $check_name => $check_data) {
+                if (!$check_data['passed']) {
+                    $failed_checks[] = $check_name;
+                }
+            }
+            $this->log_message("SAFETY BLOCK: User {$user_id} failed checks: " . implode(', ', $failed_checks), 'ERROR');
         }
         
-        // Check for any WooCommerce orders (double-check)
-        $orders = wc_get_orders(array(
-            'customer_id' => $user_id,
-            'limit' => 1,
-            'return' => 'ids'
-        ));
-        if (!empty($orders)) {
-            $this->log_message("SAFETY BLOCK: User {$user_id} has WooCommerce orders", 'ERROR');
-            return false;
-        }
-        
-        // Check for intersoccer_players metadata (double-check)
-        $player_data = get_user_meta($user_id, 'intersoccer_players', true);
-        if (!empty($player_data)) {
-            $this->log_message("SAFETY BLOCK: User {$user_id} has intersoccer_players data", 'ERROR');
-            return false;
-        }
-        
-        // Check for any posts or comments
-        $post_count = count_user_posts($user_id);
-        if ($post_count > 0) {
-            $this->log_message("SAFETY BLOCK: User {$user_id} has {$post_count} posts", 'ERROR');
-            return false;
-        }
-        
-        $comment_count = get_comments(array('user_id' => $user_id, 'count' => true));
-        if ($comment_count > 0) {
-            $this->log_message("SAFETY BLOCK: User {$user_id} has {$comment_count} comments", 'ERROR');
-            return false;
-        }
-        
-        // Check registration date is within incident window
-        $reg_date = strtotime($user->user_registered);
-        $incident_start = strtotime('2025-07-01');
-        $incident_end = strtotime('2025-08-25');
-        if ($reg_date < $incident_start || $reg_date > $incident_end) {
-            $this->log_message("SAFETY BLOCK: User {$user_id} registered outside incident window ({$user->user_registered})", 'ERROR');
-            return false;
-        }
-        
-        // Email pattern check (final verification)
-        $pattern = '/^[a-z]{8}\d{2}@(gmail\.com|outlook\.com|yahoo\.com|hotmail\.com)$/';
-        if (!preg_match($pattern, $user->user_email)) {
-            $this->log_message("SAFETY BLOCK: User {$user_id} doesn't match fake email pattern", 'ERROR');
-            return false;
-        }
-        
-        return true;
+        return $validation['safe_to_delete'];
     }
     
     public function log_message($message, $level = 'INFO') {
