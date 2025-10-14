@@ -150,8 +150,8 @@ class InterSoccer_Fake_User_Cleanup {
             <!-- Scan Section -->
             <div class="card">
                 <h2>Step 1: Scan for Fake Users</h2>
-                <p>Identifies users matching the fake user pattern with no orders or player data.</p>
-                <p><strong>Performance Optimized:</strong> Uses batched database queries for 10x faster processing.</p>
+                <p>Advanced fake user detection using behavioral analysis, account patterns, and scoring system.</p>
+                <p><strong>Detection Methods:</strong> Email patterns, login activity, profile completeness, registration patterns, content analysis</p>
                 
                 <div class="scan-options">
                     <label>Batch size: <select id="scan-batch-size">
@@ -646,6 +646,44 @@ class InterSoccer_Fake_User_Cleanup {
                 $('#cleanup-users').prop('disabled', false).text('Start Cleanup');
                 $('#cleanup-progress-container').hide();
             }
+
+            function displayScanResults(results) {
+                // Display summary
+                let summaryHtml = '<div class="summary-grid">';
+                summaryHtml += `<div class="summary-item"><h4>Total Scanned</h4><div class="number">${results.total_scanned}</div></div>`;
+                summaryHtml += `<div class="summary-item"><h4>Pattern Matches</h4><div class="number">${results.pattern_matches}</div></div>`;
+                summaryHtml += `<div class="summary-item"><h4>Fake Users Found</h4><div class="number">${results.fake_users_count}</div></div>`;
+                summaryHtml += `<div class="summary-item"><h4>Safe to Delete</h4><div class="number">${results.safe_to_delete}</div></div>`;
+                summaryHtml += '</div>';
+                $('#scan-summary').html(summaryHtml);
+                
+                // Display sample users with fake scores
+                if (results.sample_users && results.sample_users.length > 0) {
+                    let sampleHtml = '<h4>Sample Fake Users (with detection scores):</h4>';
+                    results.sample_users.forEach(user => {
+                        const statusClass = user.safe_to_delete ? 'status-safe' : 'status-warning';
+                        const statusText = user.safe_to_delete ? 'Safe to Delete' : 'Unsafe';
+                        sampleHtml += `<div class="user-item">
+                            <span class="status-indicator ${statusClass}"></span>
+                            <strong>ID ${user.ID}:</strong> ${user.user_email} 
+                            <em>(Registered: ${new Date(user.user_registered).toLocaleDateString()})</em>
+                            <br><small>Status: ${statusText}</small>
+                        </div>`;
+                    });
+                    $('#sample-users').html(sampleHtml);
+                }
+                
+                // Display safety breakdown
+                if (results.safety_breakdown) {
+                    let breakdownHtml = '<h4>Why Users Are Not Safe to Delete:</h4>';
+                    Object.entries(results.safety_breakdown).forEach(([reason, count]) => {
+                        breakdownHtml += `<div class="check-result failed">
+                            <span>${reason.replace(/_/g, ' ')}: ${count} users</span>
+                        </div>`;
+                    });
+                    $('#safety-check-breakdown').html(breakdownHtml);
+                }
+            }
         });
         </script>
         <?php
@@ -877,7 +915,7 @@ class InterSoccer_Fake_User_Cleanup {
             }
             
             // Use pre-loaded data for validation
-            $validation = $this->optimized_user_validation(
+            $validation = $this->advanced_fake_user_detection(
                 $user, 
                 $meta_by_user[$user_id] ?? array(),
                 $orders_check[$user_id] ?? null,
@@ -1602,6 +1640,199 @@ class InterSoccer_Fake_User_Cleanup {
         }
         
         @file_put_contents($this->log_file, $log_entry, FILE_APPEND | LOCK_EX);
+    }
+    
+    private function advanced_fake_user_detection($user, $user_meta, $orders_data, $posts_data, $comments_data, $detailed_logging = false) {
+        $validation = array(
+            'user_id' => $user->ID,
+            'email' => $user->user_email,
+            'is_fake' => false,
+            'safe_to_delete' => false,
+            'fake_score' => 0, // 0-100 score of fakeness
+            'checks' => array()
+        );
+
+        // === BASIC PATTERN CHECKS ===
+        $pattern = '/^[a-z]{8}\d{2}@(gmail\.com|outlook\.com|yahoo\.com|hotmail\.com)$/';
+        $email_pattern_match = (bool) preg_match($pattern, $user->user_email);
+        $validation['checks']['email_pattern'] = array(
+            'passed' => $email_pattern_match,
+            'description' => 'Email matches suspicious pattern',
+            'score' => $email_pattern_match ? 30 : 0
+        );
+        if ($email_pattern_match) $validation['fake_score'] += 30;
+
+        // === BEHAVIORAL ANALYSIS ===
+        
+        // 1. Login Activity (check if user ever logged in)
+        global $wpdb;
+        $last_login = get_user_meta($user->ID, 'last_login', true);
+        $login_count = get_user_meta($user->ID, 'login_count', true);
+        $never_logged_in = empty($last_login) && empty($login_count);
+        $validation['checks']['never_logged_in'] = array(
+            'passed' => $never_logged_in,
+            'description' => 'User never logged in',
+            'score' => $never_logged_in ? 25 : 0,
+            'value' => $never_logged_in ? 'Never logged in' : 'Has login activity'
+        );
+        if ($never_logged_in) $validation['fake_score'] += 25;
+
+        // 2. Account Age vs Activity (old account, no activity)
+        $account_age_days = (time() - strtotime($user->user_registered)) / (60 * 60 * 24);
+        $old_inactive_account = $account_age_days > 30 && $never_logged_in;
+        $validation['checks']['old_inactive'] = array(
+            'passed' => $old_inactive_account,
+            'description' => 'Old account with no activity',
+            'score' => $old_inactive_account ? 15 : 0,
+            'value' => "Age: {$account_age_days} days"
+        );
+        if ($old_inactive_account) $validation['fake_score'] += 15;
+
+        // 3. Profile Completeness
+        $empty_profile = empty($user->display_name) || $user->display_name === $user->user_login;
+        $no_description = empty(get_user_meta($user->ID, 'description', true));
+        $no_website = empty(get_user_meta($user->ID, 'user_url', true));
+        $incomplete_profile = $empty_profile && $no_description && $no_website;
+        $validation['checks']['incomplete_profile'] = array(
+            'passed' => $incomplete_profile,
+            'description' => 'Incomplete profile information',
+            'score' => $incomplete_profile ? 10 : 0,
+            'value' => $incomplete_profile ? 'Empty profile' : 'Has profile data'
+        );
+        if ($incomplete_profile) $validation['fake_score'] += 10;
+
+        // === ACCOUNT CHARACTERISTICS ===
+        
+        // 4. Sequential User IDs (bulk creation pattern)
+        $prev_user_id = $user->ID - 1;
+        $next_user_id = $user->ID + 1;
+        $sequential_pattern = false;
+        
+        // Check if surrounding IDs have similar registration times (within 1 hour)
+        $surrounding_users = $wpdb->get_results($wpdb->prepare(
+            "SELECT ID, user_registered FROM {$wpdb->users} 
+             WHERE ID IN (%d, %d, %d)",
+            $prev_user_id, $user->ID, $next_user_id
+        ));
+        
+        if (count($surrounding_users) >= 2) {
+            $times = array_column($surrounding_users, 'user_registered', 'ID');
+            $user_time = strtotime($times[$user->ID]);
+            $time_diffs = [];
+            
+            if (isset($times[$prev_user_id])) {
+                $time_diffs[] = abs($user_time - strtotime($times[$prev_user_id]));
+            }
+            if (isset($times[$next_user_id])) {
+                $time_diffs[] = abs($user_time - strtotime($times[$next_user_id]));
+            }
+            
+            // If registered within 5 minutes of neighboring accounts
+            $sequential_pattern = !empty(array_filter($time_diffs, function($diff) { return $diff < 300; }));
+        }
+        
+        $validation['checks']['sequential_registration'] = array(
+            'passed' => $sequential_pattern,
+            'description' => 'Sequential registration pattern',
+            'score' => $sequential_pattern ? 20 : 0,
+            'value' => $sequential_pattern ? 'Bulk registration pattern' : 'Normal registration'
+        );
+        if ($sequential_pattern) $validation['fake_score'] += 20;
+
+        // 5. Default User Data
+        $capabilities = isset($user_meta[$wpdb->get_blog_prefix() . 'capabilities']) ? 
+                        maybe_unserialize($user_meta[$wpdb->get_blog_prefix() . 'capabilities']) : array();
+        $only_customer_role = !empty($capabilities) && 
+                             array_keys($capabilities) === ['customer'] && 
+                             $capabilities['customer'] == 1;
+        $validation['checks']['default_customer_role'] = array(
+            'passed' => $only_customer_role,
+            'description' => 'Only default customer role',
+            'score' => $only_customer_role ? 5 : 0,
+            'value' => $only_customer_role ? 'Only customer role' : 'Has other roles'
+        );
+        if ($only_customer_role) $validation['fake_score'] += 5;
+
+        // === CONTENT ANALYSIS ===
+        
+        // 6. No Content Creation
+        $post_count = $posts_data ? intval($posts_data->post_count) : 0;
+        $comment_count = $comments_data ? intval($comments_data->comment_count) : 0;
+        $no_content = $post_count === 0 && $comment_count === 0;
+        $validation['checks']['no_content'] = array(
+            'passed' => $no_content,
+            'description' => 'No posts or comments',
+            'score' => $no_content ? 10 : 0,
+            'value' => "Posts: {$post_count}, Comments: {$comment_count}"
+        );
+        if ($no_content) $validation['fake_score'] += 10;
+
+        // === EXISTING CHECKS (Orders & Player Data) ===
+        
+        // 7. No Orders
+        $has_orders = $orders_data && $orders_data->order_count > 0;
+        $validation['checks']['no_orders'] = array(
+            'passed' => !$has_orders,
+            'description' => 'No WooCommerce orders',
+            'score' => !$has_orders ? 15 : 0,
+            'value' => $has_orders ? 'Has orders' : 'No orders'
+        );
+        if (!$has_orders) $validation['fake_score'] += 15;
+
+        // 8. No Player Data
+        $player_data = isset($user_meta['intersoccer_players']) ? maybe_unserialize($user_meta['intersoccer_players']) : null;
+        $has_player_data = false;
+        if (!empty($player_data) && is_array($player_data)) {
+            foreach ($player_data as $player) {
+                if (is_array($player) && (!empty($player['first_name']) || !empty($player['last_name']) || !empty($player['dob']) || !empty($player['gender']))) {
+                    $has_player_data = true;
+                    break;
+                }
+            }
+        }
+        $validation['checks']['no_player_data'] = array(
+            'passed' => !$has_player_data,
+            'description' => 'No intersoccer_players metadata',
+            'score' => !$has_player_data ? 15 : 0,
+            'value' => $has_player_data ? 'Has player data' : 'No player data'
+        );
+        if (!$has_player_data) $validation['fake_score'] += 15;
+
+        // === SCORING SYSTEM ===
+        
+        // Determine if fake based on score and critical criteria
+        $critical_criteria = $email_pattern_match && !$has_orders && !$has_player_data;
+        $high_score_fake = $validation['fake_score'] >= 70;
+        
+        $validation['is_fake'] = $critical_criteria || $high_score_fake;
+        
+        // Safety checks (must pass these even if fake)
+        $capabilities_meta = maybe_unserialize($user->capabilities);
+        $user_roles = $capabilities_meta ? array_keys(array_filter($capabilities_meta)) : array();
+        $has_admin_caps = !empty(array_intersect($user_roles, array('administrator', 'editor', 'author')));
+        $has_elevated_role = !empty(array_diff($user_roles, array('subscriber', 'customer', 'coach', 'event_organizer', 'organization_intern', 'shop_manager', '')));
+        
+        $validation['checks']['not_admin'] = array(
+            'passed' => !$has_admin_caps && !$has_elevated_role,
+            'description' => 'Not an administrator or elevated user',
+            'score' => 0, // Safety check, not scoring
+            'value' => 'Roles: ' . implode(', ', $user_roles)
+        );
+        
+        // Final safety determination
+        $validation['safe_to_delete'] = $validation['is_fake'] && 
+                                       $validation['checks']['not_admin']['passed'] && 
+                                       $validation['checks']['no_orders']['passed'] && 
+                                       $validation['checks']['no_player_data']['passed'];
+
+        // Add score to result
+        $validation['fake_score_percentage'] = min(100, $validation['fake_score']);
+        
+        if ($detailed_logging && $validation['is_fake']) {
+            $this->log_message("Advanced fake detection for user {$user->ID}: Score {$validation['fake_score']}%, Safe: " . ($validation['safe_to_delete'] ? 'YES' : 'NO'), 'INFO');
+        }
+
+        return $validation;
     }
 }
 
