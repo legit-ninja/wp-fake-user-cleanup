@@ -11,6 +11,11 @@ if (!isset($mock_options)) {
     $mock_options = [];
 }
 
+global $mock_transients;
+if (!isset($mock_transients)) {
+    $mock_transients = [];
+}
+
 if (!defined('ARRAY_A')) {
     define('ARRAY_A', 'ARRAY_A');
 }
@@ -103,9 +108,62 @@ if (!function_exists('delete_option')) {
     }
 }
 
+if (!function_exists('set_transient')) {
+    function set_transient($key, $value, $expiration = 0) {
+        global $mock_transients;
+        $mock_transients[$key] = $value;
+        return true;
+    }
+}
+
+if (!function_exists('get_transient')) {
+    function get_transient($key) {
+        global $mock_transients;
+        return array_key_exists($key, $mock_transients) ? $mock_transients[$key] : false;
+    }
+}
+
+if (!function_exists('delete_transient')) {
+    function delete_transient($key) {
+        global $mock_transients;
+        unset($mock_transients[$key]);
+        return true;
+    }
+}
+
+if (!function_exists('wp_json_encode')) {
+    function wp_json_encode($data) {
+        return json_encode($data);
+    }
+}
+
 if (!function_exists('content_url')) {
     function content_url($path = '') {
         return 'https://example.com/wp-content' . $path;
+    }
+}
+
+if (!function_exists('plugin_dir_url')) {
+    function plugin_dir_url($file) {
+        return 'https://example.com/wp-content/plugins/fake-user-cleanup/';
+    }
+}
+
+if (!function_exists('wp_enqueue_script')) {
+    function wp_enqueue_script($handle, $src = '', $deps = array(), $ver = false, $in_footer = false) {
+        return true;
+    }
+}
+
+if (!function_exists('wp_localize_script')) {
+    function wp_localize_script($handle, $object_name, $data) {
+        return true;
+    }
+}
+
+if (!function_exists('wp_print_scripts')) {
+    function wp_print_scripts($handle = null) {
+        return null;
     }
 }
 
@@ -119,6 +177,51 @@ if (!function_exists('wp_delete_user')) {
     function wp_delete_user($user_id) {
         $GLOBALS['mock_deleted_users'][] = $user_id;
         return true;
+    }
+}
+
+if (!function_exists('get_user_meta')) {
+    function get_user_meta($user_id, $key = '', $single = false) {
+        global $mock_user_meta;
+        if (!isset($mock_user_meta)) {
+            $mock_user_meta = [];
+        }
+        $uid = (int) $user_id;
+        if (!isset($mock_user_meta[$uid])) {
+            return $single ? '' : [];
+        }
+        if ($key === '') {
+            return $single ? $mock_user_meta[$uid] : $mock_user_meta[$uid];
+        }
+        $row = $mock_user_meta[$uid];
+        if (!is_array($row) || !array_key_exists($key, $row)) {
+            return $single ? '' : [];
+        }
+        return $single ? $row[$key] : [$row[$key]];
+    }
+}
+
+if (!function_exists('apply_filters')) {
+    function apply_filters($tag, $value, ...$args) {
+        return $value;
+    }
+}
+
+if (!function_exists('maybe_unserialize')) {
+    function maybe_unserialize($data) {
+        if (is_serialized($data)) {
+            return @unserialize($data);
+        }
+        return $data;
+    }
+}
+
+if (!function_exists('is_serialized')) {
+    function is_serialized($data) {
+        if (!is_string($data)) {
+            return false;
+        }
+        return preg_match('/^[aOs]:\d+:/', $data) === 1;
     }
 }
 

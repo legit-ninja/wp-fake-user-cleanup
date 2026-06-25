@@ -2,7 +2,7 @@
 /**
  * Plugin Name: InterSoccer Fake User Cleanup
  * Description: Fixed cleanup tool with proper validation logic
- * Version: 1.0.0
+ * Version: 1.6.25
  * Author: Jeremy Lee
  */
 
@@ -12,7 +12,11 @@ if (!defined('ABSPATH')) {
 }
 
 class InterSoccer_Fake_User_Cleanup {
-    
+
+    private const SCHEMA_VERSION = 4;
+    private const SCHEMA_VERSION_OPTION = 'intersoccer_fake_cleanup_schema_version';
+    private const COHORT_TRANSIENT_TTL = 86400;
+
     private $log_file;
     private $transient_key = 'intersoccer_fake_ids_v3';
 
@@ -20,6 +24,7 @@ class InterSoccer_Fake_User_Cleanup {
     private $audit_table = 'intersoccer_cleanup_audit';
 
     private $scan_current_option = 'intersoccer_scan_current';
+    private $scan_last_summary_option = 'intersoccer_scan_last_summary';
     private $cleanup_current_option = 'intersoccer_cleanup_current';
     private $scan_progress_prefix = 'intersoccer_scan_progress_';
     private $cleanup_progress_prefix = 'intersoccer_cleanup_progress_';
@@ -72,6 +77,42 @@ class InterSoccer_Fake_User_Cleanup {
 
     private function generate_session_id() {
         return wp_generate_uuid4();
+    }
+
+    private function get_cohort_transient_key($session_id) {
+        return 'intersoccer_scan_cohorts_' . $session_id;
+    }
+
+    private function delete_cohort_transient($session_id) {
+        if ($session_id) {
+            delete_transient($this->get_cohort_transient_key($session_id));
+        }
+    }
+
+    private function maybe_upgrade_schema() {
+        $stored_version = (int) get_option(self::SCHEMA_VERSION_OPTION, 0);
+        if ($stored_version >= self::SCHEMA_VERSION) {
+            return;
+        }
+        $this->ensure_temp_table();
+        $this->ensure_audit_table();
+        update_option(self::SCHEMA_VERSION_OPTION, self::SCHEMA_VERSION);
+    }
+
+    private function maybe_add_users_registered_index() {
+        if (!apply_filters('intersoccer_fake_cleanup_add_users_index', false)) {
+            return;
+        }
+        global $wpdb;
+        try {
+            $index_name = 'intersoccer_registered_id';
+            $existing = $wpdb->get_results("SHOW INDEX FROM {$wpdb->users} WHERE Key_name = '{$index_name}'", ARRAY_A);
+            if (empty($existing)) {
+                $wpdb->query("ALTER TABLE {$wpdb->users} ADD INDEX {$index_name} (user_registered, ID)");
+            }
+        } catch (Exception $e) {
+            $this->log_message('users_index_failed', array('message' => $e->getMessage()), 'warning');
+        }
     }
 
     private function ensure_temp_table() {
@@ -133,6 +174,10 @@ class InterSoccer_Fake_User_Cleanup {
         if (!in_array('registered_idx', $index_names, true)) {
             $wpdb->query("ALTER TABLE $table_name ADD INDEX registered_idx (registered)");
         }
+
+        if (!in_array('needs_review_idx', $index_names, true)) {
+            $wpdb->query("ALTER TABLE $table_name ADD INDEX needs_review_idx (needs_review, score, id)");
+        }
     }
 
     private function ensure_audit_table() {
@@ -159,7 +204,7 @@ class InterSoccer_Fake_User_Cleanup {
     }
     
     public function __construct() {
-        $this->log_file = WP_CONTENT_DIR . '/intersoccer-cleanup-enhanced.log';
+        $this->log_file = WP_CONTENT_DIR . '/intersoccer-cleanup-logs/intersoccer-cleanup-enhanced.log';
         add_action('admin_menu', array($this, 'add_admin_menu'));
         add_action('wp_ajax_scan_fake_users_enhanced', array($this, 'ajax_scan_fake_users'));
         add_action('wp_ajax_cleanup_fake_users_enhanced', array($this, 'ajax_cleanup_fake_users'));
@@ -167,17 +212,17 @@ class InterSoccer_Fake_User_Cleanup {
         
         add_action('wp_ajax_get_scan_status', array($this, 'ajax_get_scan_status'));
         add_action('wp_ajax_reset_scan', array($this, 'ajax_reset_scan'));
+        add_action('wp_ajax_reset_cleanup', array($this, 'ajax_reset_cleanup'));
         add_action('wp_ajax_get_cleanup_status', array($this, 'ajax_get_cleanup_status'));
         add_action('wp_ajax_get_scan_results', array($this, 'ajax_get_scan_results')); // New handler for getting scan results
         add_action('wp_ajax_download_cleanup_review', array($this, 'ajax_download_cleanup_review'));
-        // Add admin scripts for nonce
-        add_action('admin_footer', array($this, 'admin_footer_script'));
+        add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_assets'));
     }
 
     public static function activate() {
         $instance = new self();
-        $instance->ensure_temp_table();
-        $instance->ensure_audit_table();
+        $instance->maybe_upgrade_schema();
+        $instance->maybe_add_users_registered_index();
     }
 
     public function ajax_get_scan_status() {
@@ -191,10 +236,17 @@ class InterSoccer_Fake_User_Cleanup {
         $progress = $active_session ? $this->load_scan_progress($active_session) : array();
         $incomplete = !empty($progress) && $progress['status'] === 'running';
 
+        global $wpdb;
+        $this->maybe_upgrade_schema();
+        $has_results = (bool) $wpdb->get_var(
+            "SELECT 1 FROM {$wpdb->prefix}{$this->temp_table} LIMIT 1"
+        );
+
         wp_send_json_success(array(
             'incomplete' => $incomplete,
             'session' => $progress,
-            'session_id' => $active_session
+            'session_id' => $active_session,
+            'has_results' => $has_results
         ));
     }
 
@@ -209,26 +261,51 @@ class InterSoccer_Fake_User_Cleanup {
         $session_id = isset($_POST['session_id']) ? sanitize_text_field($_POST['session_id']) : get_option($this->scan_current_option, '');
         if ($session_id) {
             $this->delete_scan_progress($session_id);
+            $this->delete_cohort_transient($session_id);
         }
         update_option($this->scan_current_option, '');
+        delete_option($this->scan_last_summary_option);
         $this->log_message("Scan and cleanup progress reset");
         wp_send_json_success();
     }
+
+    public function ajax_reset_cleanup() {
+        check_ajax_referer('fake_user_cleanup_enhanced', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Insufficient permissions'));
+        }
+
+        $session_id = isset($_POST['session_id']) ? sanitize_text_field($_POST['session_id']) : get_option($this->cleanup_current_option, '');
+        if ($session_id) {
+            $this->delete_cleanup_progress($session_id);
+        }
+        update_option($this->cleanup_current_option, '');
+        $this->log_message("Cleanup progress reset (scan results preserved)");
+        wp_send_json_success();
+    }
     
-    public function admin_footer_script() {
+    public function enqueue_admin_assets($hook) {
         if (!isset($_GET['page']) || $_GET['page'] !== 'enhanced-fake-user-cleanup') {
             return;
         }
-        ?>
-        <script>
-        window.intersoccerCleanup = {
-            ajaxurl: '<?php echo admin_url('admin-ajax.php'); ?>',
-            nonce: '<?php echo wp_create_nonce('fake_user_cleanup_enhanced'); ?>'
-        };
-        </script>
-        <?php
+        $script_url = plugin_dir_url(__FILE__) . 'assets/js/fake-user-cleanup-admin.js';
+        wp_enqueue_script(
+            'intersoccer-fake-user-cleanup-admin',
+            $script_url,
+            array('jquery'),
+            '1.6.25',
+            true
+        );
+        wp_localize_script('intersoccer-fake-user-cleanup-admin', 'intersoccerCleanup', array(
+            'ajaxurl' => admin_url('admin-ajax.php'),
+            'nonce'   => wp_create_nonce('fake_user_cleanup_enhanced'),
+            'defaults' => array(
+                'scanBatchDelayMs'    => 2000,
+                'cleanupBatchDelayMs' => 2000
+            )
+        ));
     }
-    
+
     public function add_admin_menu() {
         add_management_page(
             'Fake User Cleanup',
@@ -272,13 +349,20 @@ class InterSoccer_Fake_User_Cleanup {
                 
                 <div class="scan-options">
                     <label>Batch size: <select id="scan-batch-size">
-                        <option value="100" selected>100 (Optimized)</option>
+                        <option value="50" selected>50 (Conservative)</option>
+                        <option value="100">100 (Optimized)</option>
                         <option value="200">200 (Fast)</option>
-                        <option value="500">500 (Very Fast)</option>
-                        <option value="50">50 (Conservative)</option>
+                        <option value="25">25 (Very Safe)</option>
+                    </select></label>
+
+                    <label>Inter-batch delay (ms): <select id="scan-batch-delay-ms">
+                        <option value="500">500</option>
+                        <option value="1000">1000</option>
+                        <option value="2000" selected>2000</option>
+                        <option value="5000">5000</option>
                     </select></label>
                     
-                    <label><input type="checkbox" id="detailed-logging" checked> Enable detailed logging</label>
+                    <label><input type="checkbox" id="detailed-logging"> Enable detailed logging</label>
                     <label><input type="checkbox" id="debug-first-10"> Debug first 10 users in detail</label>
                 </div>
                 
@@ -324,10 +408,22 @@ class InterSoccer_Fake_User_Cleanup {
                     <label><input type="checkbox" id="dry-run" checked> Dry Run (Log only, no deletion)</label>
                     <label><input type="checkbox" id="force-cleanup"> Force cleanup (bypass some safety checks)</label>
                     <label>Cleanup batch size: <select id="cleanup-batch-size">
-                        <option value="50" selected>50 (Optimized)</option>
+                        <option value="25" selected>25 (Low impact)</option>
+                        <option value="50">50 (Optimized)</option>
                         <option value="100">100 (Fast)</option>
-                        <option value="25">25 (Conservative)</option>
                         <option value="10">10 (Very Safe)</option>
+                    </select></label>
+                    <label>Delay after each delete (ms): <select id="cleanup-delay-ms">
+                        <option value="0">0 (none)</option>
+                        <option value="10">10</option>
+                        <option value="25">25</option>
+                        <option value="50">50</option>
+                    </select></label>
+                    <label>Inter-batch delay (ms): <select id="cleanup-batch-delay-ms">
+                        <option value="500">500</option>
+                        <option value="1000">1000</option>
+                        <option value="2000" selected>2000</option>
+                        <option value="5000">5000</option>
                     </select></label>
                 </div>
                 
@@ -349,7 +445,7 @@ class InterSoccer_Fake_User_Cleanup {
                 </div>
                 
                 <?php if (file_exists($this->log_file)) : ?>
-                    <p><a href="<?php echo content_url('/intersoccer-cleanup-enhanced.log'); ?>" target="_blank" class="button">View Log</a></p>
+                    <p><a href="<?php echo esc_url(content_url('/intersoccer-cleanup-logs/intersoccer-cleanup-enhanced.log')); ?>" target="_blank" class="button">View Log</a> <em>(may be blocked by server; use FTP or server access if needed)</em></p>
                 <?php endif; ?>
             </div>
         </div>
@@ -476,914 +572,11 @@ class InterSoccer_Fake_User_Cleanup {
         }
         </style>
         
-        <script>
-        jQuery(document).ready(function($) {
-            let scanInProgress = false;
-            let cleanupInProgress = false;
-            let scanSessionId = null;
-            let cleanupSessionId = null;
-
-            function generateSessionId(prefix) {
-                if (window.crypto && window.crypto.randomUUID) {
-                    return (prefix ? prefix + '-' : '') + window.crypto.randomUUID();
-                }
-                return (prefix ? prefix + '-' : '') + Date.now() + '-' + Math.floor(Math.random() * 1000);
-            }
-
-            // Check for existing session on load
-            $.ajax({
-                url: window.intersoccerCleanup.ajaxurl,
-                type: 'POST',
-                data: {
-                    action: 'get_scan_status',
-                    nonce: window.intersoccerCleanup.nonce
-                },
-                success: function(response) {
-                    if (response.success && response.data.incomplete && response.data.session) {
-                        scanSessionId = response.data.session_id || (response.data.session ? response.data.session.session_id : null);
-                        $('#resume-scan').show();
-                        $('#reset-scan').show();
-                        $('#scan-users').text('Resume Scan');
-                        alert('Incomplete scan detected. Processed: ' + response.data.session.processed + '/' + response.data.session.total_users);
-                    }
-                }
-            });
-
-            // Check for incomplete cleanup session
-            checkIncompleteCleanup();
-
-            // Check for existing scan results and show cleanup section if needed
-            checkExistingScanResults();
-
-            function checkExistingScanResults() {
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    data: {
-                        action: 'get_scan_status',
-                        nonce: window.intersoccerCleanup.nonce
-                    },
-                    success: function(response) {
-                        // If scan was completed (not incomplete), check if we have results to show cleanup
-                        if (response.success && !response.data.incomplete) {
-                            // Make a separate call to check if temp table has results
-                            $.ajax({
-                                url: window.intersoccerCleanup.ajaxurl,
-                                type: 'POST',
-                                data: {
-                                    action: 'validate_date_range',
-                                    nonce: window.intersoccerCleanup.nonce,
-                                    start_date: '2000-01-01', // Dummy dates just to get user count
-                                    end_date: '2030-12-31'
-                                },
-                                success: function(validateResponse) {
-                                    if (validateResponse.success && validateResponse.data.pattern_matches > 0) {
-                                        // We have scan results, show the cleanup section
-                                        $('#results-section').show();
-                                        $('#cleanup-section').show();
-
-                                        // Load and display the scan results
-                                        loadExistingScanResults();
-                                    }
-                                }
-                            });
-                        }
-                    }
-                });
-            }
-
-            function loadExistingScanResults() {
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    data: {
-                        action: 'get_scan_results',
-                        nonce: window.intersoccerCleanup.nonce
-                    },
-                    success: function(resultsResponse) {
-                        if (resultsResponse.success) {
-                            $('#results-section').show();
-                            $('#cleanup-section').show();
-                            displayCompletedScanResults(resultsResponse.data);
-                        }
-                    }
-                });
-            }
-
-            $('#validate-date-range').click(function() {
-                validateDateRange();
-            });
-
-            $('#scan-users').click(function() {
-                if (!scanInProgress) {
-                    if ($('#scan-users').text() === 'Resume Scan') {
-                        resumeScan(scanSessionId);
-                    } else {
-                        startNewScan();
-                    }
-                }
-            });
-
-            $('#resume-scan').click(function() {
-                if (!scanInProgress) {
-                    resumeScan(scanSessionId);
-                }
-            });
-
-            $('#reset-scan').click(function() {
-                if (confirm('Reset scan data? This will start a new scan.')) {
-                    $.ajax({
-                        url: window.intersoccerCleanup.ajaxurl,
-                        type: 'POST',
-                        data: {
-                            action: 'reset_scan',
-                            nonce: window.intersoccerCleanup.nonce
-                        },
-                        success: function() {
-                            location.reload();
-                        }
-                    });
-                }
-            });
-
-            $('#cleanup-users').click(function() {
-                if (!cleanupInProgress) {
-                    const dryRun = $('#dry-run').is(':checked');
-                    const forceCleanup = $('#force-cleanup').is(':checked');
-                    let confirmMsg = dryRun ? 
-                        'Start dry run cleanup? No users will be deleted.' : 
-                        'Are you sure you want to delete these users? This action cannot be undone!';
-                    if (forceCleanup && !dryRun) {
-                        confirmMsg += '\n\nWARNING: Force cleanup is enabled - some safety checks will be bypassed!';
-                    }
-                    if (confirm(confirmMsg)) {
-                        startCleanup();
-                    }
-                }
-            });
-
-            $('#download-review').click(function() {
-                const downloadUrl = `${window.intersoccerCleanup.ajaxurl}?action=download_cleanup_review&nonce=${window.intersoccerCleanup.nonce}`;
-                window.location = downloadUrl;
-            });
-
-            $('#resume-cleanup').click(function() {
-                if (!cleanupInProgress) {
-                    resumeCleanup();
-                }
-            });
-
-            $('#reset-cleanup').click(function() {
-                if (confirm('Reset cleanup data? This will start a new cleanup.')) {
-                    $.ajax({
-                        url: window.intersoccerCleanup.ajaxurl,
-                        type: 'POST',
-                        data: {
-                            action: 'reset_scan',
-                            nonce: window.intersoccerCleanup.nonce
-                        },
-                        success: function() {
-                            location.reload();
-                        }
-                    });
-                }
-            });
-
-            function validateDateRange() {
-                const startDate = $('#incident-start-date').val();
-                const endDate = $('#incident-end-date').val();
-                if (!startDate || !endDate) {
-                    alert('Please select both start and end dates');
-                    return;
-                }
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    data: {
-                        action: 'validate_date_range',
-                        nonce: window.intersoccerCleanup.nonce,
-                        start_date: startDate,
-                        end_date: endDate
-                    },
-                    success: function(response) {
-                        if (response.success) {
-                            $('#date-validation-results').show();
-                            $('#date-validation-summary').html(
-                                `<p><strong>Date range validated:</strong> Found ${response.data.users_in_range} users registered between ${startDate} and ${endDate}</p>
-                                <p><em>Pattern matches: ${response.data.pattern_matches}</em></p>`
-                            );
-                        } else {
-                            alert('Error validating date range: ' + response.data.message);
-                        }
-                    }
-                });
-            }
-
-            function startNewScan() {
-                const startDate = $('#incident-start-date').val();
-                const endDate = $('#incident-end-date').val();
-                if (!startDate || !endDate) {
-                    alert('Please select both start and end dates');
-                    return;
-                }
-                scanInProgress = true;
-                $('#scan-users').prop('disabled', true).text('Starting new scan...');
-                $('#resume-scan, #reset-scan').hide();
-                $('#scan-progress-container').show();
-                $('#results-section, #cleanup-section, #debug-section').hide();
-                const batchSize = parseInt($('#scan-batch-size').val());
-                scanSessionId = generateSessionId('scan');
-                processScanBatch(batchSize, true);
-            }
-
-            function resumeScan(sessionId) {
-                scanInProgress = false; // Don't set to true yet
-                $('#scan-users').prop('disabled', true).text('Checking scan status...');
-                $('#resume-scan, #reset-scan').hide();
-                $('#scan-progress-container').show();
-                // Don't hide results and cleanup sections initially
-                const batchSize = parseInt($('#scan-batch-size').val());
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    data: {
-                        action: 'get_scan_status',
-                        nonce: window.intersoccerCleanup.nonce,
-                        session_id: sessionId
-                    },
-                    success: function(response) {
-                        if (response.success && response.data.session) {
-                            const session = response.data.session;
-                            scanSessionId = response.data.session_id || session.session_id;
-                            
-                            // Check if scan is already complete
-                            if (session.status === 'completed') {
-                                // Scan is complete, show results and cleanup sections
-                                $('#scan-users').prop('disabled', false).text('Scan Complete');
-                                $('#scan-progress-container').hide();
-                                $('#results-section').show();
-                                $('#cleanup-section').show();
-                                
-                                // Display the results
-                                const results = {
-                                    total_processed: session.processed,
-                                    fake_found: session.fake_found,
-                                    safe_found: session.safe_found,
-                                    sample_users: [], // We'll need to get this from temp table
-                                    safety_checks: [
-                                        { rule: 'Email pattern validation', passed: true },
-                                        { rule: 'Date range filtering', passed: true },
-                                        { rule: 'Duplicate detection', passed: true }
-                                    ]
-                                };
-                                
-                                // Get sample users from temp table
-                                $.ajax({
-                                    url: window.intersoccerCleanup.ajaxurl,
-                                    type: 'POST',
-                                    data: {
-                                        action: 'get_scan_results',
-                                        nonce: window.intersoccerCleanup.nonce
-                                    },
-                                    success: function(resultsResponse) {
-                                        if (resultsResponse.success) {
-                                            displayCompletedScanResults(resultsResponse.data);
-                                        }
-                                    }
-                                });
-                                
-                                return;
-                            }
-                            
-                            // Check if there are existing results (scan was interrupted but had progress)
-                            if (session.processed > 0) {
-                                // Show results section with current progress
-                                $('#results-section').show();
-                                $('#cleanup-section').show(); // Show cleanup even if scan incomplete
-                                
-                                // Display current progress in results
-                                let summaryHtml = `
-                                    <div class="summary-grid">
-                                        <div class="summary-item">
-                                            <h4>Total Users Processed</h4>
-                                            <div class="number">${session.processed}</div>
-                                        </div>
-                                        <div class="summary-item">
-                                            <h4>Fake Users Detected</h4>
-                                            <div class="number status-danger">${session.fake_found}</div>
-                                        </div>
-                                        <div class="summary-item">
-                                            <h4>Safe Users</h4>
-                                            <div class="number status-safe">${session.safe_found}</div>
-                                        </div>
-                                    </div>
-                                    <p><em>Scan was interrupted. Click "Resume Scan" to continue or proceed to cleanup with current results.</em></p>
-                                `;
-                                $('#scan-summary').html(summaryHtml);
-                            }
-                            
-                            // Scan is incomplete, resume processing
-                            scanInProgress = true;
-                            updateScanProgress({
-                                percent: session.total_users > 0 ? (session.processed / session.total_users) * 100 : 0,
-                                processed: session.processed,
-                                fake_found: session.fake_found,
-                                safe_found: session.safe_found,
-                                memory_mb: 0
-                            });
-                            processScanBatch(batchSize, false);
-                        } else {
-                            alert('Error resuming scan: ' + (response.data.message || 'Session not found'));
-                            resetScanUI();
-                        }
-                    },
-                    error: function() {
-                        alert('Error checking scan status');
-                        resetScanUI();
-                    }
-                });
-            }
-
-            $('#reset-scan').click(function() {
-                if (confirm('Reset scan data? This will start a new scan.')) {
-                    $.ajax({
-                        url: window.intersoccerCleanup.ajaxurl,
-                        type: 'POST',
-                        data: {
-                            action: 'reset_scan',
-                            nonce: window.intersoccerCleanup.nonce
-                        },
-                        success: function() {
-                            location.reload();
-                        }
-                    });
-                }
-            });
-
-            $('#cleanup-users').click(function() {
-                if (!cleanupInProgress) {
-                    const dryRun = $('#dry-run').is(':checked');
-                    const forceCleanup = $('#force-cleanup').is(':checked');
-                    let confirmMsg = dryRun ? 
-                        'Start dry run cleanup? No users will be deleted.' : 
-                        'Are you sure you want to delete these users? This action cannot be undone!';
-                    if (forceCleanup && !dryRun) {
-                        confirmMsg += '\n\nWARNING: Force cleanup is enabled - some safety checks will be bypassed!';
-                    }
-                    if (confirm(confirmMsg)) {
-                        startCleanup();
-                    }
-                }
-            });
-
-            $('#resume-cleanup').click(function() {
-                if (!cleanupInProgress) {
-                    resumeCleanup();
-                }
-            });
-
-            $('#reset-cleanup').click(function() {
-                if (confirm('Reset cleanup data? This will start a new cleanup.')) {
-                    $.ajax({
-                        url: window.intersoccerCleanup.ajaxurl,
-                        type: 'POST',
-                        data: {
-                            action: 'reset_scan',
-                            nonce: window.intersoccerCleanup.nonce
-                        },
-                        success: function() {
-                            location.reload();
-                        }
-                    });
-                }
-            });
-
-            function validateDateRange() {
-                const startDate = $('#incident-start-date').val();
-                const endDate = $('#incident-end-date').val();
-                if (!startDate || !endDate) {
-                    alert('Please select both start and end dates');
-                    return;
-                }
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    data: {
-                        action: 'validate_date_range',
-                        nonce: window.intersoccerCleanup.nonce,
-                        start_date: startDate,
-                        end_date: endDate
-                    },
-                    success: function(response) {
-                        if (response.success) {
-                            $('#date-validation-results').show();
-                            $('#date-validation-summary').html(
-                                `<p><strong>Date range validated:</strong> Found ${response.data.users_in_range} users registered between ${startDate} and ${endDate}</p>
-                                <p><em>Pattern matches: ${response.data.pattern_matches}</em></p>`
-                            );
-                        } else {
-                            alert('Error validating date range: ' + response.data.message);
-                        }
-                    }
-                });
-            }
-
-            function startNewScan() {
-                const startDate = $('#incident-start-date').val();
-                const endDate = $('#incident-end-date').val();
-                if (!startDate || !endDate) {
-                    alert('Please select both start and end dates');
-                    return;
-                }
-                scanInProgress = true;
-                $('#scan-users').prop('disabled', true).text('Starting new scan...');
-                $('#resume-scan, #reset-scan').hide();
-                $('#scan-progress-container').show();
-                $('#results-section, #cleanup-section, #debug-section').hide();
-                const batchSize = parseInt($('#scan-batch-size').val());
-                scanSessionId = generateSessionId('scan');
-                processScanBatch(batchSize, true);
-            }
-
-            function resumeScan(sessionId) {
-                scanInProgress = false; // Don't set to true yet
-                $('#scan-users').prop('disabled', true).text('Checking scan status...');
-                $('#resume-scan, #reset-scan').hide();
-                $('#scan-progress-container').show();
-                // Don't hide results and cleanup sections initially
-                const batchSize = parseInt($('#scan-batch-size').val());
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    data: {
-                        action: 'get_scan_status',
-                        nonce: window.intersoccerCleanup.nonce,
-                        session_id: sessionId
-                    },
-                    success: function(response) {
-                        if (response.success && response.data.session) {
-                            const session = response.data.session;
-                            
-                            // Check if scan is already complete
-                            if (session.status === 'completed') {
-                                // Scan is complete, show results and cleanup sections
-                                $('#scan-users').prop('disabled', false).text('Scan Complete');
-                                $('#scan-progress-container').hide();
-                                $('#results-section').show();
-                                $('#cleanup-section').show();
-                                
-                                // Display the results
-                                const results = {
-                                    total_processed: session.processed,
-                                    fake_found: session.fake_found,
-                                    safe_found: session.safe_found,
-                                    sample_users: [], // We'll need to get this from temp table
-                                    safety_checks: [
-                                        { rule: 'Email pattern validation', passed: true },
-                                        { rule: 'Date range filtering', passed: true },
-                                        { rule: 'Duplicate detection', passed: true }
-                                    ]
-                                };
-                                
-                                // Get sample users from temp table
-                                $.ajax({
-                                    url: window.intersoccerCleanup.ajaxurl,
-                                    type: 'POST',
-                                    data: {
-                                        action: 'get_scan_results',
-                                        nonce: window.intersoccerCleanup.nonce
-                                    },
-                                    success: function(resultsResponse) {
-                                        if (resultsResponse.success) {
-                                            displayCompletedScanResults(resultsResponse.data);
-                                        }
-                                    }
-                                });
-                                
-                                return;
-                            }
-                            
-                            // Check if there are existing results (scan was interrupted but had progress)
-                            if (session.processed > 0) {
-                                // Show results section with current progress
-                                $('#results-section').show();
-                                $('#cleanup-section').show(); // Show cleanup even if scan incomplete
-                                
-                                // Display current progress in results
-                                let summaryHtml = `
-                                    <div class="summary-grid">
-                                        <div class="summary-item">
-                                            <h4>Total Users Processed</h4>
-                                            <div class="number">${session.processed}</div>
-                                        </div>
-                                        <div class="summary-item">
-                                            <h4>Fake Users Detected</h4>
-                                            <div class="number status-danger">${session.fake_found}</div>
-                                        </div>
-                                        <div class="summary-item">
-                                            <h4>Safe Users</h4>
-                                            <div class="number status-safe">${session.safe_found}</div>
-                                        </div>
-                                    </div>
-                                    <p><em>Scan was interrupted. Click "Resume Scan" to continue or proceed to cleanup with current results.</em></p>
-                                `;
-                                $('#scan-summary').html(summaryHtml);
-                            }
-                            
-                            // Scan is incomplete, resume processing
-                            scanInProgress = true;
-                            updateScanProgress({
-                                percent: session.total_users > 0 ? (session.processed / session.total_users) * 100 : 0,
-                                processed: session.processed,
-                                fake_found: session.fake_found,
-                                safe_found: session.safe_found,
-                                memory_mb: 0
-                            });
-                            processScanBatch(batchSize, false);
-                        } else {
-                            alert('Error resuming scan: ' + (response.data.message || 'Session not found'));
-                            resetScanUI();
-                        }
-                    },
-                    error: function() {
-                        alert('Error checking scan status');
-                        resetScanUI();
-                    }
-                });
-            }
-
-            function processScanBatch(batchSize, isNewScan) {
-                const startDate = $('#incident-start-date').val();
-                const endDate = $('#incident-end-date').val();
-                const detailedLogging = $('#detailed-logging').is(':checked');
-                const debugFirst10 = $('#debug-first-10').is(':checked');
-                $('#scan-users').text(isNewScan ? 'Scanning users...' : 'Processing next batch...');
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    timeout: 120000,
-                    data: {
-                        action: 'scan_fake_users_enhanced',
-                        nonce: window.intersoccerCleanup.nonce,
-                        session_id: scanSessionId,
-                        batch_size: batchSize,
-                        start_date: startDate,
-                        end_date: endDate,
-                        detailed_logging: detailedLogging ? 1 : 0,
-                        debug_first_10: debugFirst10 ? 1 : 0,
-                        is_new_scan: isNewScan ? 1 : 0
-                    },
-                    success: function(response) {
-                        if (response.success) {
-                            if (response.data.session_id) {
-                                scanSessionId = response.data.session_id;
-                            }
-                            updateScanProgress(response.data.progress);
-                            if (response.data.debug_info) {
-                                displayDebugInfo(response.data.debug_info);
-                            }
-                            if (response.data.completed) {
-                                completeScan(response.data.results);
-                            } else {
-                                setTimeout(function() {
-                                    processScanBatch(batchSize, false);
-                                }, 300);
-                            }
-                        } else {
-                            alert('Error during scan: ' + response.data.message + '. Progress saved; you can resume.');
-                            resetScanUI();
-                        }
-                    },
-                    error: function(xhr, status, error) {
-                        console.error('AJAX Error:', status, error);
-                        alert('Network error during scan. Progress saved; you can resume.');
-                        resetScanUI();
-                    }
-                });
-            }
-
-            function startCleanup() {
-                cleanupInProgress = true;
-                $('#cleanup-users').prop('disabled', true).text('Starting cleanup...');
-                $('#cleanup-progress-container').show();
-                $('#resume-cleanup, #reset-cleanup').hide();
-                $('#download-review').hide();
-                const batchSize = parseInt($('#cleanup-batch-size').val());
-                const dryRun = $('#dry-run').is(':checked');
-                const forceCleanup = $('#force-cleanup').is(':checked');
-                cleanupSessionId = generateSessionId('cleanup');
-                processCleanupBatch(batchSize, true, dryRun, forceCleanup);
-            }
-
-            function resumeCleanup() {
-                cleanupInProgress = true;
-                $('#cleanup-users').prop('disabled', true);
-                $('#resume-cleanup').prop('disabled', true);
-                $('#cleanup-progress-container').show();
-                
-                // Get cleanup status to determine where to resume
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    data: {
-                        action: 'get_cleanup_status',
-                        nonce: window.intersoccerCleanup.nonce
-                    },
-                    success: function(response) {
-                        if (response.success && response.data.session) {
-                            const session = response.data.session;
-                            cleanupSessionId = response.data.session_id || session.session_id;
-                            const batchSize = parseInt($('#cleanup-batch-size').val());
-                            const dryRun = $('#dry-run').is(':checked');
-                            const forceCleanup = $('#force-cleanup').is(':checked');
-                            if (session.reviewed && session.reviewed > 0) {
-                                $('#download-review').show();
-                            }
-                            
-                            $('#cleanup-users').text('Resuming cleanup...');
-                            processCleanupBatch(batchSize, false, dryRun, forceCleanup);
-                        } else {
-                            alert('No cleanup session found to resume.');
-                            resetCleanupUI();
-                        }
-                    },
-                    error: function() {
-                        alert('Error checking cleanup status.');
-                        resetCleanupUI();
-                    }
-                });
-            }
-
-            function checkIncompleteCleanup() {
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    data: {
-                        action: 'get_cleanup_status',
-                        nonce: window.intersoccerCleanup.nonce
-                    },
-                    success: function(response) {
-                        if (response.success && response.data.incomplete && response.data.session) {
-                            cleanupSessionId = response.data.session_id || (response.data.session ? response.data.session.session_id : null);
-                            $('#resume-cleanup').show();
-                            $('#reset-cleanup').show();
-                            $('#cleanup-users').text('Resume Cleanup');
-                            if (response.data.session.reviewed && response.data.session.reviewed > 0) {
-                                $('#download-review').show();
-                            }
-                            alert('Incomplete cleanup detected. Processed: ' + response.data.session.processed + '/' + response.data.session.total_users);
-                        } else {
-                            cleanupSessionId = null;
-                            $('#resume-cleanup').hide();
-                            $('#reset-cleanup').hide();
-                        }
-                    }
-                });
-            }
-
-            function resetScanUI() {
-                scanInProgress = false;
-                $('#scan-users').prop('disabled', false).text('Start Scan');
-                $('#scan-progress-container').hide();
-                
-                // Check if we can resume
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    data: {
-                        action: 'get_scan_status',
-                        nonce: window.intersoccerCleanup.nonce
-                    },
-                    success: function(response) {
-                        if (response.success && response.data.incomplete && response.data.session) {
-                            scanSessionId = response.data.session_id || (response.data.session ? response.data.session.session_id : null);
-                            $('#resume-scan').show();
-                            $('#reset-scan').show();
-                            $('#scan-users').text('Resume Scan');
-                        } else {
-                            scanSessionId = null;
-                            $('#resume-scan').hide();
-                            $('#reset-scan').hide();
-                        }
-                    }
-                });
-            }
-
-            function resetCleanupUI() {
-                cleanupInProgress = false;
-                $('#cleanup-users').prop('disabled', false).text('Start Cleanup');
-                $('#cleanup-progress-container').hide();
-                $('#download-review').hide();
-                
-                // Check if we can resume
-                checkIncompleteCleanup();
-            }
-
-            function updateScanProgress(progress) {
-                const percent = Math.round(progress.percent);
-                $('#scan-progress-fill').css('width', percent + '%');
-                $('#scan-progress-text').text(percent + '% complete');
-                let stats = `Processed: ${progress.processed} | Fake found: ${progress.fake_found} | Safe found: ${progress.safe_found}`;
-                if (typeof progress.total_users !== 'undefined' && progress.total_users !== null) {
-                    stats += ` | Total: ${progress.total_users}`;
-                }
-                $('#scan-stats').html(stats);
-            }
-
-            function completeScan(results) {
-                scanInProgress = false;
-                scanSessionId = null;
-                $('#scan-users').prop('disabled', false).text('Scan Complete');
-                $('#scan-progress-container').hide();
-                $('#results-section').show();
-                $('#cleanup-section').show();
-                
-                // Display results summary
-                let summaryHtml = `
-                    <div class="summary-grid">
-                        <div class="summary-item">
-                            <h4>Total Users Processed</h4>
-                            <div class="number">${results.total_processed}</div>
-                        </div>
-                        <div class="summary-item">
-                            <h4>Fake Users Detected</h4>
-                            <div class="number status-danger">${results.fake_found}</div>
-                        </div>
-                        <div class="summary-item">
-                            <h4>Safe Users</h4>
-                            <div class="number status-safe">${results.safe_found}</div>
-                        </div>
-                    </div>
-                `;
-                $('#scan-summary').html(summaryHtml);
-                
-                // Sample of detected fake users
-                let sampleHtml = '<h3>Sample of Detected Fake Users:</h3><div class="sample-users">';
-                results.sample_users.forEach(user => {
-                    const reasonSummary = (user.reasons || []).map(reason => reason.code || reason).join(', ');
-                    sampleHtml += `
-                        <div class="user-item">
-                            <span class="status-indicator status-danger"></span>
-                            ${user.email} (ID: ${user.id}, Score: ${user.score ?? 'n/a'})${reasonSummary ? `<div class="debug-details">Reasons: ${reasonSummary}</div>` : ''}
-                        </div>
-                    `;
-                });
-                sampleHtml += '</div>';
-                $('#sample-users').html(sampleHtml);
-                
-                // Safety check breakdown
-                let safetyHtml = '<h3>Safety Check Breakdown:</h3>';
-                results.safety_checks.forEach(check => {
-                    safetyHtml += `
-                        <div class="check-result ${check.passed ? 'passed' : 'failed'}">
-                            <div>${check.rule}</div>
-                            <div>${check.passed ? '✔️' : '❌'}</div>
-                        </div>
-                    `;
-                });
-                $('#safety-check-breakdown').html(safetyHtml);
-            }
-
-            function displayDebugInfo(debugInfo) {
-                let debugHtml = '<h3>Debug Information:</h3><div class="debug-output">';
-                debugInfo.forEach(item => {
-                    debugHtml += `
-                        <div class="debug-item">
-                            <strong>${item.label}:</strong> ${item.value}
-                        </div>
-                    `;
-                });
-                debugHtml += '</div>';
-                $('#debug-output').html(debugHtml);
-                $('#debug-section').show();
-            }
-
-            function processCleanupBatch(batchSize, isNewCleanup, dryRun, forceCleanup) {
-                $('#cleanup-users').text(isNewCleanup ? 'Processing cleanup...' : 'Processing next cleanup batch...');
-                
-                $.ajax({
-                    url: window.intersoccerCleanup.ajaxurl,
-                    type: 'POST',
-                    timeout: 120000,
-                    data: {
-                        action: 'cleanup_fake_users_enhanced',
-                        nonce: window.intersoccerCleanup.nonce,
-                        session_id: cleanupSessionId,
-                        batch_size: batchSize,
-                        dry_run: dryRun ? 1 : 0,
-                        force_cleanup: forceCleanup ? 1 : 0,
-                        is_new_cleanup: isNewCleanup ? 1 : 0
-                    },
-                    success: function(response) {
-                        if (response.success) {
-                            if (response.data.session_id) {
-                                cleanupSessionId = response.data.session_id;
-                            }
-                            updateCleanupProgress(response.data.progress);
-                            
-                            if (response.data.completed) {
-                                completeCleanup(response.data);
-                            } else {
-                                setTimeout(function() {
-                                    processCleanupBatch(batchSize, false, dryRun, forceCleanup);
-                                }, 300);
-                            }
-                        } else {
-                            alert('Error during cleanup: ' + response.data.message);
-                            resetCleanupUI();
-                        }
-                    },
-                    error: function(xhr, status, error) {
-                        console.error('Cleanup AJAX Error:', status, error);
-                        alert('Network error during cleanup. Progress saved; you can resume.');
-                        resetCleanupUI();
-                    }
-                });
-            }
-
-            function updateCleanupProgress(progress) {
-                const percent = Math.round(progress.percent);
-                $('#cleanup-progress-fill').css('width', percent + '%');
-                $('#cleanup-progress-text').text(percent + '% complete');
-                let stats = `Processed: ${progress.processed} | Deleted: ${progress.deleted} | Skipped: ${progress.skipped}`;
-                if (typeof progress.reviewed !== 'undefined' && progress.reviewed !== null) {
-                    stats += ` | Needs Review: ${progress.reviewed}`;
-                }
-                if (typeof progress.total_users !== 'undefined' && progress.total_users !== null) {
-                    stats += ` | Total: ${progress.total_users}`;
-                }
-                $('#cleanup-stats').html(stats);
-                if (progress.reviewed && progress.reviewed > 0) {
-                    $('#download-review').show();
-                } else {
-                    $('#download-review').hide();
-                }
-            }
-
-            function completeCleanup(data) {
-                cleanupInProgress = false;
-                cleanupSessionId = null;
-                $('#cleanup-users').prop('disabled', false).text('Cleanup Complete');
-                $('#cleanup-progress-container').hide();
-                
-                const action = data.dry_run ? 'would be deleted' : 'deleted';
-                alert(`Cleanup completed! ${data.progress.deleted} users ${action}.`);
-                
-                // Refresh the page to show updated results
-                location.reload();
-            }
-
-            function displayCompletedScanResults(results) {
-                // Display results summary
-                let summaryHtml = `
-                    <div class="summary-grid">
-                        <div class="summary-item">
-                            <h4>Total Users Processed</h4>
-                            <div class="number">${results.total_processed}</div>
-                        </div>
-                        <div class="summary-item">
-                            <h4>Fake Users Detected</h4>
-                            <div class="number status-danger">${results.fake_found}</div>
-                        </div>
-                        <div class="summary-item">
-                            <h4>Safe Users</h4>
-                            <div class="number status-safe">${results.safe_found}</div>
-                        </div>
-                    </div>
-                `;
-                $('#scan-summary').html(summaryHtml);
-                
-                // Sample of detected fake users
-                let sampleHtml = '<h3>Sample of Detected Fake Users:</h3><div class="sample-users">';
-                results.sample_users.forEach(user => {
-                    const reasonSummary = (user.reasons || []).map(reason => reason.code || reason).join(', ');
-                    sampleHtml += `
-                        <div class="user-item">
-                            <span class="status-indicator status-danger"></span>
-                            ${user.email} (ID: ${user.id}, Score: ${user.score ?? 'n/a'})${reasonSummary ? `<div class="debug-details">Reasons: ${reasonSummary}</div>` : ''}
-                        </div>
-                    `;
-                });
-                sampleHtml += '</div>';
-                $('#sample-users').html(sampleHtml);
-                
-                // Safety check breakdown
-                let safetyHtml = '<h3>Safety Check Breakdown:</h3>';
-                results.safety_checks.forEach(check => {
-                    safetyHtml += `
-                        <div class="check-result ${check.passed ? 'passed' : 'failed'}">
-                            <div>${check.rule}</div>
-                            <div>${check.passed ? '✔️' : '❌'}</div>
-                        </div>
-                    `;
-                });
-                $('#safety-check-breakdown').html(safetyHtml);
-                
-                // Check for incomplete cleanup
-                checkIncompleteCleanup();
-            }
-        });
-        </script>
+        <?php
+        // Admin JS is enqueued via enqueue_admin_assets (intersoccer-fake-user-cleanup-admin) with intersoccerCleanup localized.
+        wp_print_scripts('intersoccer-fake-user-cleanup-admin');
+        ?>
+        </div>
         <?php
     }
 
@@ -1411,6 +604,10 @@ class InterSoccer_Fake_User_Cleanup {
         $log_dir = dirname($this->log_file);
         if (!is_dir($log_dir) && function_exists('wp_mkdir_p')) {
             wp_mkdir_p($log_dir);
+            $htaccess = $log_dir . '/.htaccess';
+            if (is_dir($log_dir) && !file_exists($htaccess)) {
+                @file_put_contents($htaccess, "Require all denied\nDeny from all\n", LOCK_EX);
+            }
         }
 
         file_put_contents($this->log_file, $encoded . PHP_EOL, FILE_APPEND | LOCK_EX);
@@ -1456,9 +653,10 @@ class InterSoccer_Fake_User_Cleanup {
 
     private function process_scan_batch($session_id, array $args) {
         global $wpdb;
-
-        $this->ensure_temp_table();
-        $this->ensure_audit_table();
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(300);
+        }
+        $this->maybe_upgrade_schema();
 
         $batch_size = max(1, intval($args['batch_size'] ?? 100));
         $is_new_scan = !empty($args['is_new_scan']);
@@ -1477,6 +675,8 @@ class InterSoccer_Fake_User_Cleanup {
                 $start_date . ' 00:00:00',
                 $end_date . ' 23:59:59'
             ));
+
+            $this->prefetch_cohort_map($session_id, $start_date, $end_date);
 
             $progress = array(
                 'session_id' => $session_id,
@@ -1507,6 +707,10 @@ class InterSoccer_Fake_User_Cleanup {
             if (empty($start_date) || empty($end_date)) {
                 throw new Exception('Stored session is missing date filters.');
             }
+
+            if (false === get_transient($this->get_cohort_transient_key($session_id))) {
+                $this->prefetch_cohort_map($session_id, $start_date, $end_date);
+            }
         }
 
         $last_id = intval($progress['last_id'] ?? 0);
@@ -1524,28 +728,31 @@ class InterSoccer_Fake_User_Cleanup {
             $batch_size
         ));
 
+        $cohort_map = get_transient($this->get_cohort_transient_key($session_id));
+        if (!is_array($cohort_map)) {
+            $cohort_map = array();
+        }
+
+        $batch_context = $this->build_scan_batch_context($users, $cohort_map);
+
         $fake_found = 0;
         $safe_found = 0;
         $debug_info = array();
+        $fake_rows = array();
 
         foreach ($users as $user) {
-            $evaluation = $this->evaluate_user($user, $debug_first_10 && count($debug_info) < 10);
+            $evaluation = $this->evaluate_user($user, $debug_first_10 && count($debug_info) < 10, $batch_context);
 
             if ($evaluation['is_fake']) {
                 $fake_found++;
-
-                $wpdb->replace(
-                    $wpdb->prefix . $this->temp_table,
-                    array(
-                        'id' => $user->ID,
-                        'email' => $user->user_email,
-                        'registered' => $user->user_registered,
-                        'score' => $evaluation['score'],
-                        'reason' => wp_json_encode($evaluation['reasons']),
-                        'needs_review' => 0,
-                        'review_notes' => null
-                    ),
-                    array('%d', '%s', '%s', '%d', '%s', '%d', '%s')
+                $fake_rows[] = array(
+                    'id' => $user->ID,
+                    'email' => $user->user_email,
+                    'registered' => $user->user_registered,
+                    'score' => $evaluation['score'],
+                    'reason' => wp_json_encode($evaluation['reasons']),
+                    'needs_review' => 0,
+                    'review_notes' => null
                 );
 
                 if ($debug_first_10 && count($debug_info) < 10) {
@@ -1584,6 +791,8 @@ class InterSoccer_Fake_User_Cleanup {
             }
         }
 
+        $this->insert_fake_users_batch($fake_rows);
+
         $count_users = count($users);
         $progress['processed'] += $count_users;
         $progress['fake_found'] += $fake_found;
@@ -1597,21 +806,33 @@ class InterSoccer_Fake_User_Cleanup {
         if ($completed && $progress['status'] !== 'completed') {
             $progress['status'] = 'completed';
             $progress['end_time'] = time();
+            update_option($this->scan_last_summary_option, array(
+                'total_processed' => $progress['processed'],
+                'fake_found' => $progress['fake_found'],
+                'safe_found' => $progress['safe_found'],
+                'total_users' => $progress['total_users'],
+                'session_id' => $session_id,
+                'end_time' => $progress['end_time']
+            ));
             update_option($this->scan_current_option, '');
+            $this->delete_scan_progress($session_id);
+            $this->delete_cohort_transient($session_id);
+        } else {
+            $this->save_scan_progress($session_id, $progress);
         }
 
-        $this->save_scan_progress($session_id, $progress);
-
-        $this->log_message('scan_batch', array(
-            'session_id' => $session_id,
-            'processed' => $progress['processed'],
-            'batch_size' => $batch_size,
-            'batch_users' => $count_users,
-            'fake_found' => $fake_found,
-            'safe_found' => $safe_found,
-            'last_id' => $progress['last_id'],
-            'detailed_logging' => $detailed_logging ? 1 : 0
-        ));
+        if ($detailed_logging) {
+            $this->log_message('scan_batch', array(
+                'session_id' => $session_id,
+                'processed' => $progress['processed'],
+                'batch_size' => $batch_size,
+                'batch_users' => $count_users,
+                'fake_found' => $fake_found,
+                'safe_found' => $safe_found,
+                'last_id' => $progress['last_id'],
+                'detailed_logging' => 1
+            ));
+        }
 
         $percent = 0;
         if ($progress['total_users'] > 0) {
@@ -1652,13 +873,15 @@ class InterSoccer_Fake_User_Cleanup {
         $dry_run = !empty($_POST['dry_run']);
         $force_cleanup = !empty($_POST['force_cleanup']);
         $is_new_cleanup = intval($_POST['is_new_cleanup']) === 1;
+        $delay_after_delete_ms = max(0, intval($_POST['delay_after_delete_ms'] ?? 0));
 
         try {
             $result = $this->process_cleanup_batch($session_id, array(
                 'batch_size' => $batch_size,
                 'dry_run' => $dry_run,
                 'force_cleanup' => $force_cleanup,
-                'is_new_cleanup' => $is_new_cleanup
+                'is_new_cleanup' => $is_new_cleanup,
+                'delay_after_delete_ms' => $delay_after_delete_ms
             ));
 
             wp_send_json_success($result);
@@ -1673,14 +896,17 @@ class InterSoccer_Fake_User_Cleanup {
 
     private function process_cleanup_batch($session_id, array $args) {
         global $wpdb;
-
-        $this->ensure_temp_table();
-        $this->ensure_audit_table();
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(300);
+        }
+        $this->maybe_upgrade_schema();
 
         $batch_size = max(1, intval($args['batch_size'] ?? 50));
         $dry_run = !empty($args['dry_run']);
         $force_cleanup = !empty($args['force_cleanup']);
         $is_new_cleanup = !empty($args['is_new_cleanup']);
+        $delay_after_delete_ms = max(0, intval($args['delay_after_delete_ms'] ?? 0));
+        $detailed_logging = !empty($args['detailed_logging']);
 
         if ($is_new_cleanup) {
             $total_fake_users = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}{$this->temp_table}");
@@ -1696,7 +922,8 @@ class InterSoccer_Fake_User_Cleanup {
                 'last_id' => 0,
                 'start_time' => time(),
                 'dry_run' => $dry_run ? 1 : 0,
-                'force_cleanup' => $force_cleanup ? 1 : 0
+                'force_cleanup' => $force_cleanup ? 1 : 0,
+                'delay_after_delete_ms' => $delay_after_delete_ms
             );
 
             $this->save_cleanup_progress($session_id, $cleanup_progress);
@@ -1711,6 +938,7 @@ class InterSoccer_Fake_User_Cleanup {
             }
             $dry_run = isset($cleanup_progress['dry_run']) ? (bool) $cleanup_progress['dry_run'] : $dry_run;
             $force_cleanup = isset($cleanup_progress['force_cleanup']) ? (bool) $cleanup_progress['force_cleanup'] : $force_cleanup;
+            $delay_after_delete_ms = isset($cleanup_progress['delay_after_delete_ms']) ? (int) $cleanup_progress['delay_after_delete_ms'] : 0;
         }
 
         $last_id = intval($cleanup_progress['last_id'] ?? 0);
@@ -1726,9 +954,28 @@ class InterSoccer_Fake_User_Cleanup {
         $reviewed = 0;
         $processed_ids = array();
         $review_users = array();
+        $audit_rows = array();
+
+        $user_ids = array_map(function ($u) { return (int) $u->id; }, $fake_users);
+        $safety_map = array();
+        if (!empty($user_ids) && !$force_cleanup) {
+            $safety_map = $this->get_user_safety_flags_batch($user_ids);
+        }
+
+        $registered_map = array();
+        if (!empty($user_ids)) {
+            $reg_placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
+            $reg_rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT ID, user_registered FROM {$wpdb->users} WHERE ID IN ($reg_placeholders)",
+                $user_ids
+            ));
+            foreach ($reg_rows as $r) {
+                $registered_map[(int) $r->ID] = $r->user_registered;
+            }
+        }
 
         foreach ($fake_users as $fake_user) {
-            $safety_flags = $this->get_user_safety_flags($fake_user->id);
+            $safety_flags = $force_cleanup ? array() : ($safety_map[$fake_user->id] ?? array());
             if (!empty($safety_flags) && !$force_cleanup) {
                 $reviewed++;
                 $skipped++;
@@ -1761,24 +1008,19 @@ class InterSoccer_Fake_User_Cleanup {
             $processed_ids[] = $fake_user->id;
 
             if (!$dry_run) {
-                $user_registered = $wpdb->get_var($wpdb->prepare(
-                    "SELECT user_registered FROM {$wpdb->users} WHERE ID = %d",
-                    $fake_user->id
-                ));
+                $user_registered = $registered_map[$fake_user->id] ?? null;
 
                 $result = wp_delete_user($fake_user->id);
                 if ($result) {
                     $deleted++;
-
-                    $wpdb->insert(
-                        $wpdb->prefix . $this->audit_table,
-                        array(
-                            'user_id' => $fake_user->id,
-                            'email' => $fake_user->email,
-                            'registered' => $user_registered
-                        ),
-                        array('%d', '%s', '%s')
+                    $audit_rows[] = array(
+                        'user_id' => $fake_user->id,
+                        'email' => $fake_user->email,
+                        'registered' => $user_registered
                     );
+                    if ($delay_after_delete_ms > 0) {
+                        usleep($delay_after_delete_ms * 1000);
+                    }
                 } else {
                     $skipped++;
                     $this->log_message('cleanup_delete_failed', array(
@@ -1789,6 +1031,20 @@ class InterSoccer_Fake_User_Cleanup {
             } else {
                 $deleted++;
             }
+        }
+
+        if (!$dry_run && !empty($audit_rows)) {
+            $audit_table = $wpdb->prefix . $this->audit_table;
+            $values = array();
+            $params = array();
+            foreach ($audit_rows as $row) {
+                $values[] = '(%d, %s, %s)';
+                $params[] = $row['user_id'];
+                $params[] = $row['email'];
+                $params[] = $row['registered'];
+            }
+            $sql = "INSERT INTO {$audit_table} (user_id, email, registered) VALUES " . implode(', ', $values);
+            $wpdb->query($wpdb->prepare($sql, $params));
         }
 
         if (!$dry_run && !empty($processed_ids)) {
@@ -1814,21 +1070,24 @@ class InterSoccer_Fake_User_Cleanup {
             $cleanup_progress['status'] = 'completed';
             $cleanup_progress['end_time'] = time();
             update_option($this->cleanup_current_option, '');
+            $this->delete_cleanup_progress($session_id);
+        } else {
+            $this->save_cleanup_progress($session_id, $cleanup_progress);
         }
 
-        $this->save_cleanup_progress($session_id, $cleanup_progress);
-
-        $this->log_message('cleanup_batch', array(
-            'session_id' => $session_id,
-            'batch_size' => $batch_size,
-            'batch_users' => $count_processed,
-            'deleted' => $deleted,
-            'skipped' => $skipped,
-            'reviewed' => $reviewed,
-            'dry_run' => $dry_run ? 1 : 0,
-            'force_cleanup' => $force_cleanup ? 1 : 0,
-            'next_last_id' => $cleanup_progress['last_id']
-        ));
+        if ($detailed_logging) {
+            $this->log_message('cleanup_batch', array(
+                'session_id' => $session_id,
+                'batch_size' => $batch_size,
+                'batch_users' => $count_processed,
+                'deleted' => $deleted,
+                'skipped' => $skipped,
+                'reviewed' => $reviewed,
+                'dry_run' => $dry_run ? 1 : 0,
+                'force_cleanup' => $force_cleanup ? 1 : 0,
+                'next_last_id' => $cleanup_progress['last_id']
+            ));
+        }
 
         $percent = 0;
         if ($cleanup_progress['total_users'] > 0) {
@@ -1856,11 +1115,159 @@ class InterSoccer_Fake_User_Cleanup {
         );
     }
 
-    private function evaluate_user($user, $debug = false) {
+    private function prefetch_cohort_map($session_id, $start_date, $end_date) {
+        global $wpdb;
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT user_registered, COUNT(*) AS cohort_count
+             FROM {$wpdb->users}
+             WHERE user_registered BETWEEN %s AND %s
+             GROUP BY user_registered
+             HAVING cohort_count >= 25",
+            $start_date . ' 00:00:00',
+            $end_date . ' 23:59:59'
+        ));
+
+        $cohort_map = array();
+        foreach ($rows as $row) {
+            $cohort_map[$row->user_registered] = (int) $row->cohort_count;
+        }
+
+        set_transient(
+            $this->get_cohort_transient_key($session_id),
+            $cohort_map,
+            self::COHORT_TRANSIENT_TTL
+        );
+
+        return $cohort_map;
+    }
+
+    /**
+     * @param array $users User row objects from the current batch.
+     * @param array $cohort_map Map of user_registered => cohort_count.
+     * @return array Batch context for evaluate_user().
+     */
+    private function build_scan_batch_context(array $users, array $cohort_map) {
+        global $wpdb;
+
+        $user_ids = array_map(function ($user) {
+            return (int) $user->ID;
+        }, $users);
+
+        $meta_map = array();
+        $meta_counts = array();
+
+        if (empty($user_ids)) {
+            return array(
+                'meta' => $meta_map,
+                'meta_counts' => $meta_counts,
+                'cohort_map' => $cohort_map
+            );
+        }
+
+        $placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
+        $meta_keys = array('first_name', 'last_name', 'intersoccer_players');
+        $meta_key_placeholders = implode(',', array_fill(0, count($meta_keys), '%s'));
+        $meta_params = array_merge($user_ids, $meta_keys);
+
+        $meta_rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT user_id, meta_key, meta_value
+             FROM {$wpdb->usermeta}
+             WHERE user_id IN ($placeholders)
+             AND meta_key IN ($meta_key_placeholders)",
+            $meta_params
+        ));
+
+        foreach ($meta_rows as $row) {
+            $uid = (int) $row->user_id;
+            if (!isset($meta_map[$uid])) {
+                $meta_map[$uid] = array();
+            }
+            $meta_map[$uid][$row->meta_key] = $row->meta_value;
+        }
+
+        $count_rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT user_id, COUNT(*) AS meta_count
+             FROM {$wpdb->usermeta}
+             WHERE user_id IN ($placeholders)
+             GROUP BY user_id",
+            $user_ids
+        ));
+
+        foreach ($count_rows as $row) {
+            $meta_counts[(int) $row->user_id] = (int) $row->meta_count;
+        }
+
+        return array(
+            'meta' => $meta_map,
+            'meta_counts' => $meta_counts,
+            'cohort_map' => $cohort_map
+        );
+    }
+
+    /**
+     * @param array $rows Fake user rows to insert.
+     */
+    private function insert_fake_users_batch(array $rows) {
+        if (empty($rows)) {
+            return;
+        }
+
+        global $wpdb;
+        $table = $wpdb->prefix . $this->temp_table;
+        $values = array();
+        $params = array();
+
+        foreach ($rows as $row) {
+            $values[] = '(%d, %s, %s, %d, %s, %d, %s)';
+            $params[] = $row['id'];
+            $params[] = $row['email'];
+            $params[] = $row['registered'];
+            $params[] = $row['score'];
+            $params[] = $row['reason'];
+            $params[] = $row['needs_review'];
+            $params[] = $row['review_notes'];
+        }
+
+        $sql = "INSERT INTO {$table} (id, email, registered, score, reason, needs_review, review_notes) VALUES "
+            . implode(', ', $values)
+            . ' ON DUPLICATE KEY UPDATE email = VALUES(email), registered = VALUES(registered),'
+            . ' score = VALUES(score), reason = VALUES(reason),'
+            . ' needs_review = VALUES(needs_review), review_notes = VALUES(review_notes)';
+
+        $result = $wpdb->query($wpdb->prepare($sql, $params));
+        if ($result === false) {
+            foreach ($rows as $row) {
+                $wpdb->replace(
+                    $table,
+                    array(
+                        'id' => $row['id'],
+                        'email' => $row['email'],
+                        'registered' => $row['registered'],
+                        'score' => $row['score'],
+                        'reason' => $row['reason'],
+                        'needs_review' => $row['needs_review'],
+                        'review_notes' => $row['review_notes']
+                    ),
+                    array('%d', '%s', '%s', '%d', '%s', '%d', '%s')
+                );
+            }
+            $this->log_message('bulk_insert_fallback', array(
+                'row_count' => count($rows),
+                'error' => $wpdb->last_error
+            ), 'warning');
+        }
+    }
+
+    private function evaluate_user($user, $debug = false, array $batch_context = array()) {
         global $wpdb;
 
         $score = 0;
         $reasons = array();
+        $disposable_domains = apply_filters('intersoccer_fake_cleanup_disposable_domains', $this->disposable_domains);
+        if (!is_array($disposable_domains)) {
+            $disposable_domains = array();
+        }
 
         $email = strtolower($user->user_email);
         $login = $user->user_login;
@@ -1875,7 +1282,7 @@ class InterSoccer_Fake_User_Cleanup {
         }
 
         $domain = substr(strrchr($email, '@'), 1);
-        if ($domain && in_array($domain, $this->disposable_domains, true)) {
+        if ($domain && in_array($domain, $disposable_domains, true)) {
             $score += 45;
             $reasons[] = array(
                 'code' => 'disposable_domain',
@@ -1891,20 +1298,33 @@ class InterSoccer_Fake_User_Cleanup {
             );
         }
 
-        $first_name = function_exists('get_user_meta') ? trim((string) get_user_meta($user->ID, 'first_name', true)) : '';
-        $last_name = function_exists('get_user_meta') ? trim((string) get_user_meta($user->ID, 'last_name', true)) : '';
+        $uid = (int) $user->ID;
+        $user_meta = $batch_context['meta'][$uid] ?? null;
+        $has_batch_meta = is_array($user_meta);
+
+        if ($has_batch_meta) {
+            $first_name = trim((string) ($user_meta['first_name'] ?? ''));
+            $last_name = trim((string) ($user_meta['last_name'] ?? ''));
+        } else {
+            $first_name = function_exists('get_user_meta') ? trim((string) get_user_meta($uid, 'first_name', true)) : '';
+            $last_name = function_exists('get_user_meta') ? trim((string) get_user_meta($uid, 'last_name', true)) : '';
+        }
         if ($first_name === '' && $last_name === '') {
             $score += 20;
             $reasons[] = array(
                 'code' => 'missing_profile_name',
-                'detail' => $user->ID
+                'detail' => $uid
             );
         }
 
-        $meta_count = (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE user_id = %d",
-            $user->ID
-        ));
+        if (isset($batch_context['meta_counts'][$uid])) {
+            $meta_count = (int) $batch_context['meta_counts'][$uid];
+        } else {
+            $meta_count = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE user_id = %d",
+                $uid
+            ));
+        }
         if ($meta_count < 3) {
             $score += 20;
             $reasons[] = array(
@@ -1913,13 +1333,35 @@ class InterSoccer_Fake_User_Cleanup {
             );
         }
 
-        $cohort_count = (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM {$wpdb->users}
-             WHERE user_registered BETWEEN DATE_SUB(%s, INTERVAL 45 SECOND)
-             AND DATE_ADD(%s, INTERVAL 45 SECOND)",
-            $user->user_registered,
-            $user->user_registered
-        ));
+        if ($has_batch_meta && array_key_exists('intersoccer_players', $user_meta)) {
+            $players_meta = $user_meta['intersoccer_players'];
+        } else {
+            $players_meta = function_exists('get_user_meta') ? get_user_meta($uid, 'intersoccer_players', true) : '';
+        }
+        if (is_string($players_meta)) {
+            $players_meta = function_exists('maybe_unserialize') ? maybe_unserialize($players_meta) : $players_meta;
+        }
+        $players_list = is_array($players_meta) ? $players_meta : array();
+        if (empty($players_list)) {
+            $score += 20;
+            $reasons[] = array(
+                'code' => 'missing_intersoccer_players',
+                'detail' => 'no_players'
+            );
+        }
+
+        $cohort_map = $batch_context['cohort_map'] ?? array();
+        if (!empty($cohort_map)) {
+            $cohort_count = (int) ($cohort_map[$user->user_registered] ?? 0);
+        } else {
+            $cohort_count = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->users}
+                 WHERE user_registered BETWEEN DATE_SUB(%s, INTERVAL 45 SECOND)
+                 AND DATE_ADD(%s, INTERVAL 45 SECOND)",
+                $user->user_registered,
+                $user->user_registered
+            ));
+        }
         if ($cohort_count >= 25) {
             $score += 30;
             $reasons[] = array(
@@ -1928,7 +1370,8 @@ class InterSoccer_Fake_User_Cleanup {
             );
         }
 
-        $is_fake = $score >= 70;
+        $threshold = (int) apply_filters('intersoccer_fake_cleanup_score_threshold', 70);
+        $is_fake = $score >= $threshold;
 
         return array(
             'is_fake' => $is_fake,
@@ -1995,6 +1438,83 @@ class InterSoccer_Fake_User_Cleanup {
         return $flags;
     }
 
+    /**
+     * Batch version of get_user_safety_flags. Returns map of user_id => array of flags
+     * to minimize queries per cleanup batch.
+     *
+     * @param int[] $user_ids User IDs to check.
+     * @return array<int, array> Map of user_id => array of flag arrays (code, detail).
+     */
+    private function get_user_safety_flags_batch(array $user_ids) {
+        global $wpdb;
+
+        $safety_map = array_fill_keys($user_ids, array());
+        if (empty($user_ids)) {
+            return $safety_map;
+        }
+
+        $placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
+
+        // Orders: user IDs that have WooCommerce orders
+        $order_user_ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT DISTINCT CAST(pm.meta_value AS UNSIGNED)
+             FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_customer_user'
+             AND pm.meta_value IN ($placeholders)
+             AND p.post_type IN ('shop_order', 'shop_order_refund')",
+            $user_ids
+        ));
+        if ($order_user_ids) {
+            foreach ($order_user_ids as $uid) {
+                $uid = (int) $uid;
+                if (isset($safety_map[$uid])) {
+                    $safety_map[$uid][] = array('code' => 'customer_has_orders');
+                }
+            }
+        }
+
+        // Authored content: user IDs that have non-trash posts
+        $author_ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT DISTINCT post_author FROM {$wpdb->posts}
+             WHERE post_author IN ($placeholders)
+             AND post_status NOT IN ('auto-draft', 'trash')",
+            $user_ids
+        ));
+        if ($author_ids) {
+            foreach ($author_ids as $uid) {
+                $uid = (int) $uid;
+                if (isset($safety_map[$uid])) {
+                    $safety_map[$uid][] = array('code' => 'authored_content');
+                }
+            }
+        }
+
+        // Activity meta: user_id + meta_key for last_activity, last_login, etc.
+        $activity_meta_keys = array('last_activity', 'last_login', 'wp_last_login', 'wc_last_active', 'session_tokens');
+        $meta_placeholders = implode(',', array_fill(0, count($activity_meta_keys), '%s'));
+        $activity_params = array_merge($user_ids, $activity_meta_keys);
+        $activity_rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT user_id, meta_key FROM {$wpdb->usermeta}
+             WHERE user_id IN ($placeholders)
+             AND meta_key IN ($meta_placeholders)",
+            $activity_params
+        ));
+        if ($activity_rows) {
+            foreach ($activity_rows as $row) {
+                $uid = (int) $row->user_id;
+                if (isset($safety_map[$uid])) {
+                    $safety_map[$uid][] = array(
+                        'code' => 'recent_activity_meta',
+                        'detail' => $row->meta_key
+                    );
+                }
+            }
+        }
+
+        return $safety_map;
+    }
+
     private function get_scan_results($session_id = null) {
         global $wpdb;
 
@@ -2003,6 +1523,22 @@ class InterSoccer_Fake_User_Cleanup {
         }
 
         $progress = $session_id ? $this->load_scan_progress($session_id) : array();
+
+        // When no active session (e.g. after completion or page reload), use persisted last summary if temp table has rows
+        if (empty($progress) || empty($progress['processed'])) {
+            $temp_count = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}{$this->temp_table}");
+            if ($temp_count > 0) {
+                $last_summary = get_option($this->scan_last_summary_option, array());
+                if (!empty($last_summary) && is_array($last_summary)) {
+                    $progress = array_merge($progress, array(
+                        'processed' => isset($last_summary['total_processed']) ? $last_summary['total_processed'] : 0,
+                        'fake_found' => isset($last_summary['fake_found']) ? $last_summary['fake_found'] : 0,
+                        'safe_found' => isset($last_summary['safe_found']) ? $last_summary['safe_found'] : 0,
+                        'total_users' => isset($last_summary['total_users']) ? $last_summary['total_users'] : 0
+                    ));
+                }
+            }
+        }
         
         // Get sample of detected fake users
         $sample_users = $wpdb->get_results(
@@ -2228,11 +1764,12 @@ class InterSoccer_Fake_User_Cleanup {
             return;
         }
 
-        $batch_size = isset($assoc_args['batch-size']) ? max(1, (int) $assoc_args['batch-size']) : 50;
+        $batch_size = isset($assoc_args['batch-size']) ? max(1, (int) $assoc_args['batch-size']) : 25;
         $dry_run = !empty($assoc_args['dry-run']);
         $force_cleanup = !empty($assoc_args['force']);
         $session_id = $assoc_args['session'] ?? '';
         $resume = !empty($assoc_args['resume']);
+        $delay_after_delete_ms = isset($assoc_args['delay-ms']) ? max(0, (int) $assoc_args['delay-ms']) : 0;
 
         if ($resume && empty($session_id)) {
             $session_id = get_option($this->cleanup_current_option, '');
@@ -2263,7 +1800,9 @@ class InterSoccer_Fake_User_Cleanup {
                     'batch_size' => $batch_size,
                     'dry_run' => $dry_run,
                     'force_cleanup' => $force_cleanup,
-                    'is_new_cleanup' => $is_new_cleanup
+                    'is_new_cleanup' => $is_new_cleanup,
+                    'delay_after_delete_ms' => $delay_after_delete_ms,
+                    'detailed_logging' => true
                 ));
 
                 $progress = $result['progress'];

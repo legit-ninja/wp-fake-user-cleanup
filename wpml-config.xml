@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<wpml-config>
+  <!--
+    Fake User Cleanup is an admin tool plugin and does not define translatable content types.
+    Any admin UI strings should be handled via gettext/WPML String Translation.
+  -->
+</wpml-config>
+
