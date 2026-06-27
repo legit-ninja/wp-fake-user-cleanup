@@ -2,7 +2,7 @@
 /**
  * Plugin Name: InterSoccer Fake User Cleanup
  * Description: Fixed cleanup tool with proper validation logic
- * Version: 1.6.25
+ * Version: 1.6.28
  * Author: Jeremy Lee
  */
 
@@ -293,7 +293,7 @@ class InterSoccer_Fake_User_Cleanup {
             'intersoccer-fake-user-cleanup-admin',
             $script_url,
             array('jquery'),
-            '1.6.25',
+            '1.6.28',
             true
         );
         wp_localize_script('intersoccer-fake-user-cleanup-admin', 'intersoccerCleanup', array(
@@ -318,7 +318,7 @@ class InterSoccer_Fake_User_Cleanup {
     
     public function admin_page() {
         ?>
-        <div class="wrap">
+        <div class="wrap intersoccer-fake-user-cleanup">
             <h1>InterSoccer Fake User Cleanup</h1>
             
             <div class="notice notice-warning">
@@ -448,9 +448,11 @@ class InterSoccer_Fake_User_Cleanup {
                     <p><a href="<?php echo esc_url(content_url('/intersoccer-cleanup-logs/intersoccer-cleanup-enhanced.log')); ?>" target="_blank" class="button">View Log</a> <em>(may be blocked by server; use FTP or server access if needed)</em></p>
                 <?php endif; ?>
             </div>
-        </div>
-        
+
         <style>
+        .wrap.intersoccer-fake-user-cleanup {
+            padding-bottom: 40px;
+        }
         .card { 
             background: #fff; 
             border: 1px solid #ccd0d4; 
@@ -571,11 +573,6 @@ class InterSoccer_Fake_User_Cleanup {
             color: #46b450;
         }
         </style>
-        
-        <?php
-        // Admin JS is enqueued via enqueue_admin_assets (intersoccer-fake-user-cleanup-admin) with intersoccerCleanup localized.
-        wp_print_scripts('intersoccer-fake-user-cleanup-admin');
-        ?>
         </div>
         <?php
     }
