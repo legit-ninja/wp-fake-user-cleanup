@@ -2,7 +2,7 @@
 /**
  * Plugin Name: InterSoccer Fake User Cleanup
  * Description: Fixed cleanup tool with proper validation logic
- * Version: 1.6.30
+ * Version: 1.6.28
  * Author: Jeremy Lee
  */
 
@@ -293,7 +293,7 @@ class InterSoccer_Fake_User_Cleanup {
             'intersoccer-fake-user-cleanup-admin',
             $script_url,
             array('jquery'),
-            '1.6.30',
+            '1.6.28',
             true
         );
         wp_localize_script('intersoccer-fake-user-cleanup-admin', 'intersoccerCleanup', array(
