@@ -2,7 +2,7 @@
 /**
  * Plugin Name: InterSoccer Fake User Cleanup
  * Description: Fixed cleanup tool with proper validation logic
- * Version: 1.6.28
+ * Version: 1.6.30
  * Author: Jeremy Lee
  */
 
@@ -293,7 +293,7 @@ class InterSoccer_Fake_User_Cleanup {
             'intersoccer-fake-user-cleanup-admin',
             $script_url,
             array('jquery'),
-            '1.6.28',
+            '1.6.30',
             true
         );
         wp_localize_script('intersoccer-fake-user-cleanup-admin', 'intersoccerCleanup', array(
@@ -301,7 +301,8 @@ class InterSoccer_Fake_User_Cleanup {
             'nonce'   => wp_create_nonce('fake_user_cleanup_enhanced'),
             'defaults' => array(
                 'scanBatchDelayMs'    => 2000,
-                'cleanupBatchDelayMs' => 2000
+                'cleanupBatchDelayMs' => 2000,
+                'activityGraceMonths' => 6
             )
         ));
     }
@@ -406,7 +407,7 @@ class InterSoccer_Fake_User_Cleanup {
                 
                 <div class="cleanup-options">
                     <label><input type="checkbox" id="dry-run" checked> Dry Run (Log only, no deletion)</label>
-                    <label><input type="checkbox" id="force-cleanup"> Force cleanup (bypass some safety checks)</label>
+                    <label><input type="checkbox" id="force-cleanup"> Force cleanup (bypass activity meta checks only; orders and authored content always protected)</label>
                     <label>Cleanup batch size: <select id="cleanup-batch-size">
                         <option value="25" selected>25 (Low impact)</option>
                         <option value="50">50 (Optimized)</option>
@@ -425,7 +426,11 @@ class InterSoccer_Fake_User_Cleanup {
                         <option value="2000" selected>2000</option>
                         <option value="5000">5000</option>
                     </select></label>
+                    <label>Activity grace period (months):
+                        <input type="number" id="activity-grace-months" min="0" max="120" value="6" style="width: 4em;">
+                    </label>
                 </div>
+                <p class="description" style="margin-top: 0;">Users with timestamp-based activity older than this grace period are eligible for deletion. Use 0 for strict mode (any activity meta blocks). <code>session_tokens</code> always blocks.</p>
                 
                 <button id="cleanup-users" class="button button-secondary">Start Cleanup</button>
                 <button id="resume-cleanup" class="button button-secondary" style="display: none;">Resume Cleanup</button>
@@ -871,6 +876,7 @@ class InterSoccer_Fake_User_Cleanup {
         $force_cleanup = !empty($_POST['force_cleanup']);
         $is_new_cleanup = intval($_POST['is_new_cleanup']) === 1;
         $delay_after_delete_ms = max(0, intval($_POST['delay_after_delete_ms'] ?? 0));
+        $activity_grace_months = max(0, intval($_POST['activity_grace_months'] ?? 6));
 
         try {
             $result = $this->process_cleanup_batch($session_id, array(
@@ -878,7 +884,8 @@ class InterSoccer_Fake_User_Cleanup {
                 'dry_run' => $dry_run,
                 'force_cleanup' => $force_cleanup,
                 'is_new_cleanup' => $is_new_cleanup,
-                'delay_after_delete_ms' => $delay_after_delete_ms
+                'delay_after_delete_ms' => $delay_after_delete_ms,
+                'activity_grace_months' => $activity_grace_months
             ));
 
             wp_send_json_success($result);
@@ -904,6 +911,9 @@ class InterSoccer_Fake_User_Cleanup {
         $is_new_cleanup = !empty($args['is_new_cleanup']);
         $delay_after_delete_ms = max(0, intval($args['delay_after_delete_ms'] ?? 0));
         $detailed_logging = !empty($args['detailed_logging']);
+        $activity_grace_months = $this->get_activity_grace_months(
+            isset($args['activity_grace_months']) ? (int) $args['activity_grace_months'] : null
+        );
 
         if ($is_new_cleanup) {
             $total_fake_users = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}{$this->temp_table}");
@@ -920,7 +930,8 @@ class InterSoccer_Fake_User_Cleanup {
                 'start_time' => time(),
                 'dry_run' => $dry_run ? 1 : 0,
                 'force_cleanup' => $force_cleanup ? 1 : 0,
-                'delay_after_delete_ms' => $delay_after_delete_ms
+                'delay_after_delete_ms' => $delay_after_delete_ms,
+                'activity_grace_months' => $activity_grace_months
             );
 
             $this->save_cleanup_progress($session_id, $cleanup_progress);
@@ -936,6 +947,9 @@ class InterSoccer_Fake_User_Cleanup {
             $dry_run = isset($cleanup_progress['dry_run']) ? (bool) $cleanup_progress['dry_run'] : $dry_run;
             $force_cleanup = isset($cleanup_progress['force_cleanup']) ? (bool) $cleanup_progress['force_cleanup'] : $force_cleanup;
             $delay_after_delete_ms = isset($cleanup_progress['delay_after_delete_ms']) ? (int) $cleanup_progress['delay_after_delete_ms'] : 0;
+            $activity_grace_months = isset($cleanup_progress['activity_grace_months'])
+                ? $this->get_activity_grace_months((int) $cleanup_progress['activity_grace_months'])
+                : $activity_grace_months;
         }
 
         $last_id = intval($cleanup_progress['last_id'] ?? 0);
@@ -955,8 +969,12 @@ class InterSoccer_Fake_User_Cleanup {
 
         $user_ids = array_map(function ($u) { return (int) $u->id; }, $fake_users);
         $safety_map = array();
-        if (!empty($user_ids) && !$force_cleanup) {
-            $safety_map = $this->get_user_safety_flags_batch($user_ids);
+        if (!empty($user_ids)) {
+            $safety_map = $this->get_user_safety_flags_batch(
+                $user_ids,
+                $activity_grace_months,
+                !$force_cleanup
+            );
         }
 
         $registered_map = array();
@@ -972,8 +990,8 @@ class InterSoccer_Fake_User_Cleanup {
         }
 
         foreach ($fake_users as $fake_user) {
-            $safety_flags = $force_cleanup ? array() : ($safety_map[$fake_user->id] ?? array());
-            if (!empty($safety_flags) && !$force_cleanup) {
+            $safety_flags = $safety_map[$fake_user->id] ?? array();
+            if (!empty($safety_flags)) {
                 $reviewed++;
                 $skipped++;
                 $review_users[] = array(
@@ -1382,8 +1400,95 @@ class InterSoccer_Fake_User_Cleanup {
         return $evaluation['is_fake'];
     }
 
-    private function get_user_safety_flags($user_id) {
+    private function get_activity_grace_months($override = null) {
+        $default = 6;
+        if ($override !== null) {
+            return max(0, (int) apply_filters('intersoccer_fake_cleanup_activity_grace_months', (int) $override));
+        }
+        return max(0, (int) apply_filters('intersoccer_fake_cleanup_activity_grace_months', $default));
+    }
+
+    private function get_timestamp_activity_meta_keys() {
+        return array('last_activity', 'last_login', 'wp_last_login', 'wc_last_active');
+    }
+
+    private function get_all_activity_meta_keys() {
+        return array_merge($this->get_timestamp_activity_meta_keys(), array('session_tokens'));
+    }
+
+    /**
+     * @param mixed $meta_value Raw usermeta value.
+     * @return int|null Unix timestamp or null if unparseable/empty.
+     */
+    private function parse_activity_meta_timestamp($meta_key, $meta_value) {
+        if ($meta_value === null || $meta_value === '' || $meta_value === false) {
+            return null;
+        }
+
+        if (is_numeric($meta_value)) {
+            $timestamp = (int) $meta_value;
+            return $timestamp > 0 ? $timestamp : null;
+        }
+
+        if (is_string($meta_value)) {
+            $parsed = strtotime($meta_value);
+            return ($parsed !== false && $parsed > 0) ? $parsed : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array|null Flag array when activity should block deletion, null otherwise.
+     */
+    private function build_activity_meta_flag($meta_key, $meta_value, $grace_months) {
+        if ($meta_key === 'session_tokens') {
+            if (!empty($meta_value)) {
+                return array('code' => 'recent_activity_meta', 'detail' => $meta_key);
+            }
+            return null;
+        }
+
+        if (!in_array($meta_key, $this->get_timestamp_activity_meta_keys(), true)) {
+            return null;
+        }
+
+        if ($meta_value === null || $meta_value === '' || $meta_value === false) {
+            return null;
+        }
+
+        if ($grace_months <= 0) {
+            return array('code' => 'recent_activity_meta', 'detail' => $meta_key);
+        }
+
+        $timestamp = $this->parse_activity_meta_timestamp($meta_key, $meta_value);
+        if ($timestamp === null) {
+            return array('code' => 'recent_activity_meta', 'detail' => $meta_key);
+        }
+
+        $cutoff = strtotime('-' . (int) $grace_months . ' months');
+        if ($timestamp >= $cutoff) {
+            return array(
+                'code' => 'recent_activity_meta',
+                'detail' => $meta_key . ' (' . gmdate('Y-m-d', $timestamp) . ')'
+            );
+        }
+
+        return null;
+    }
+
+    private function should_flag_activity_meta($meta_key, $meta_value, $grace_months) {
+        return $this->build_activity_meta_flag($meta_key, $meta_value, $grace_months) !== null;
+    }
+
+    private function get_user_safety_flags($user_id, $grace_months = null, $include_activity_checks = true) {
         global $wpdb;
+
+        if ($grace_months === null) {
+            $grace_months = $this->get_activity_grace_months();
+        } else {
+            $grace_months = $this->get_activity_grace_months((int) $grace_months);
+        }
 
         $flags = array();
 
@@ -1414,21 +1519,13 @@ class InterSoccer_Fake_User_Cleanup {
             $flags[] = array('code' => 'authored_content');
         }
 
-        // User meta activity markers
-        $meta_keys = array(
-            'last_activity',
-            'last_login',
-            'wp_last_login',
-            'wc_last_active',
-            'session_tokens'
-        );
-        foreach ($meta_keys as $key) {
-            $meta_value = function_exists('get_user_meta') ? get_user_meta($user_id, $key, true) : '';
-            if (!empty($meta_value)) {
-                $flags[] = array(
-                    'code' => 'recent_activity_meta',
-                    'detail' => $key
-                );
+        if ($include_activity_checks) {
+            foreach ($this->get_all_activity_meta_keys() as $key) {
+                $meta_value = function_exists('get_user_meta') ? get_user_meta($user_id, $key, true) : '';
+                $flag = $this->build_activity_meta_flag($key, $meta_value, $grace_months);
+                if ($flag !== null) {
+                    $flags[] = $flag;
+                }
             }
         }
 
@@ -1440,10 +1537,18 @@ class InterSoccer_Fake_User_Cleanup {
      * to minimize queries per cleanup batch.
      *
      * @param int[] $user_ids User IDs to check.
+     * @param int|null $grace_months Activity grace period in months.
+     * @param bool $include_activity_checks When false, skip activity meta checks (force cleanup).
      * @return array<int, array> Map of user_id => array of flag arrays (code, detail).
      */
-    private function get_user_safety_flags_batch(array $user_ids) {
+    private function get_user_safety_flags_batch(array $user_ids, $grace_months = null, $include_activity_checks = true) {
         global $wpdb;
+
+        if ($grace_months === null) {
+            $grace_months = $this->get_activity_grace_months();
+        } else {
+            $grace_months = $this->get_activity_grace_months((int) $grace_months);
+        }
 
         $safety_map = array_fill_keys($user_ids, array());
         if (empty($user_ids)) {
@@ -1487,24 +1592,26 @@ class InterSoccer_Fake_User_Cleanup {
             }
         }
 
-        // Activity meta: user_id + meta_key for last_activity, last_login, etc.
-        $activity_meta_keys = array('last_activity', 'last_login', 'wp_last_login', 'wc_last_active', 'session_tokens');
-        $meta_placeholders = implode(',', array_fill(0, count($activity_meta_keys), '%s'));
-        $activity_params = array_merge($user_ids, $activity_meta_keys);
-        $activity_rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT user_id, meta_key FROM {$wpdb->usermeta}
-             WHERE user_id IN ($placeholders)
-             AND meta_key IN ($meta_placeholders)",
-            $activity_params
-        ));
-        if ($activity_rows) {
-            foreach ($activity_rows as $row) {
-                $uid = (int) $row->user_id;
-                if (isset($safety_map[$uid])) {
-                    $safety_map[$uid][] = array(
-                        'code' => 'recent_activity_meta',
-                        'detail' => $row->meta_key
-                    );
+        if ($include_activity_checks) {
+            $activity_meta_keys = $this->get_all_activity_meta_keys();
+            $meta_placeholders = implode(',', array_fill(0, count($activity_meta_keys), '%s'));
+            $activity_params = array_merge($user_ids, $activity_meta_keys);
+            $activity_rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT user_id, meta_key, meta_value FROM {$wpdb->usermeta}
+                 WHERE user_id IN ($placeholders)
+                 AND meta_key IN ($meta_placeholders)",
+                $activity_params
+            ));
+            if ($activity_rows) {
+                foreach ($activity_rows as $row) {
+                    $uid = (int) $row->user_id;
+                    if (!isset($safety_map[$uid])) {
+                        continue;
+                    }
+                    $flag = $this->build_activity_meta_flag($row->meta_key, $row->meta_value, $grace_months);
+                    if ($flag !== null) {
+                        $safety_map[$uid][] = $flag;
+                    }
                 }
             }
         }
@@ -1767,6 +1874,9 @@ class InterSoccer_Fake_User_Cleanup {
         $session_id = $assoc_args['session'] ?? '';
         $resume = !empty($assoc_args['resume']);
         $delay_after_delete_ms = isset($assoc_args['delay-ms']) ? max(0, (int) $assoc_args['delay-ms']) : 0;
+        $activity_grace_months = isset($assoc_args['activity-grace-months'])
+            ? max(0, (int) $assoc_args['activity-grace-months'])
+            : 6;
 
         if ($resume && empty($session_id)) {
             $session_id = get_option($this->cleanup_current_option, '');
@@ -1799,6 +1909,7 @@ class InterSoccer_Fake_User_Cleanup {
                     'force_cleanup' => $force_cleanup,
                     'is_new_cleanup' => $is_new_cleanup,
                     'delay_after_delete_ms' => $delay_after_delete_ms,
+                    'activity_grace_months' => $activity_grace_months,
                     'detailed_logging' => true
                 ));
 

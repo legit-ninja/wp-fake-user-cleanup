@@ -314,6 +314,157 @@ class InterSoccerFakeUserCleanupTest extends TestCase
         $this->assertSame(100, $results['total_users']);
     }
 
+    public function testBuildActivityMetaFlagSkipsStaleWcLastActive()
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
+            'wc_last_active',
+            '1754438400',
+            6
+        ]);
+        $this->assertNull($flag);
+    }
+
+    public function testBuildActivityMetaFlagFlagsRecentWcLastActive()
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $recent = (string) (time() - (86400 * 30));
+        $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
+            'wc_last_active',
+            $recent,
+            6
+        ]);
+        $this->assertIsArray($flag);
+        $this->assertSame('recent_activity_meta', $flag['code']);
+        $this->assertStringContainsString('wc_last_active', $flag['detail']);
+    }
+
+    public function testBuildActivityMetaFlagStrictModeForAnyActivityMeta()
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
+            'wc_last_active',
+            '1754438400',
+            0
+        ]);
+        $this->assertSame('recent_activity_meta', $flag['code']);
+        $this->assertSame('wc_last_active', $flag['detail']);
+    }
+
+    public function testBuildActivityMetaFlagAlwaysBlocksSessionTokens()
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
+            'session_tokens',
+            'a:1:{s:64:"token";}',
+            6
+        ]);
+        $this->assertSame('recent_activity_meta', $flag['code']);
+        $this->assertSame('session_tokens', $flag['detail']);
+    }
+
+    public function testBuildActivityMetaFlagEmptyMetaDoesNotBlock()
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
+            'last_login',
+            '',
+            6
+        ]);
+        $this->assertNull($flag);
+    }
+
+    public function testBuildActivityMetaFlagUnparseableTimestampBlocks()
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
+            'last_login',
+            'not-a-date',
+            6
+        ]);
+        $this->assertSame('recent_activity_meta', $flag['code']);
+        $this->assertSame('last_login', $flag['detail']);
+    }
+
+    public function testParseActivityMetaTimestampHandlesNumericAndDatetime()
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $numeric = $this->invokePrivateMethod($instance, 'parse_activity_meta_timestamp', [
+            'wc_last_active',
+            '1754438400'
+        ]);
+        $this->assertSame(1754438400, $numeric);
+
+        $datetime = $this->invokePrivateMethod($instance, 'parse_activity_meta_timestamp', [
+            'last_login',
+            '2025-08-06 12:00:00'
+        ]);
+        $this->assertIsInt($datetime);
+        $this->assertGreaterThan(0, $datetime);
+    }
+
+    public function testGetUserSafetyFlagsBatchHardFlagsWhenActivityChecksDisabled()
+    {
+        global $wpdb;
+        $wpdb = new FakeWpdb();
+        $wpdb->prefix = 'wp_';
+        $wpdb->get_col_returns = [
+            ['42'],
+            [],
+        ];
+
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $map = $this->invokePrivateMethod($instance, 'get_user_safety_flags_batch', [[42, 99], 6, false]);
+
+        $this->assertCount(1, $map[42]);
+        $this->assertSame('customer_has_orders', $map[42][0]['code']);
+        $this->assertEmpty($map[99]);
+        $this->assertFalse($this->containsQuery($wpdb->queries, 'wp_usermeta'));
+    }
+
+    public function testGetUserSafetyFlagsBatchSkipsActivityWhenDisabled()
+    {
+        global $wpdb;
+        $wpdb = new FakeWpdb();
+        $wpdb->prefix = 'wp_';
+        $wpdb->get_col_returns = [
+            [],
+            [],
+        ];
+        $recent = (string) (time() - (86400 * 30));
+        $wpdb->get_results_returns = [
+            [(object) ['user_id' => 42, 'meta_key' => 'wc_last_active', 'meta_value' => $recent]],
+        ];
+
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $map = $this->invokePrivateMethod($instance, 'get_user_safety_flags_batch', [[42], 6, false]);
+
+        $this->assertEmpty($map[42]);
+        $this->assertFalse($this->containsQuery($wpdb->queries, 'wp_usermeta'));
+    }
+
+    public function testGetUserSafetyFlagsBatchIncludesActivityWhenEnabled()
+    {
+        global $wpdb;
+        $wpdb = new FakeWpdb();
+        $wpdb->prefix = 'wp_';
+        $wpdb->get_col_returns = [
+            [],
+            [],
+        ];
+        $recent = (string) (time() - (86400 * 30));
+        $wpdb->get_results_returns = [
+            [(object) ['user_id' => 42, 'meta_key' => 'wc_last_active', 'meta_value' => $recent]],
+        ];
+
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $map = $this->invokePrivateMethod($instance, 'get_user_safety_flags_batch', [[42], 6, true]);
+
+        $this->assertCount(1, $map[42]);
+        $this->assertSame('recent_activity_meta', $map[42][0]['code']);
+        $this->assertTrue($this->containsQuery($wpdb->queries, 'wp_usermeta'));
+    }
+
     private function containsQuery(array $queries, string $expected): bool
     {
         foreach ($queries as $query) {
@@ -356,6 +507,10 @@ class FakeWpdb
     public $get_results_returns = [];
     /** @var int Index into get_results_returns */
     private $get_results_index = 0;
+    /** @var array Optional ordered return values for get_col() */
+    public $get_col_returns = [];
+    /** @var int Index into get_col_returns */
+    private $get_col_index = 0;
 
     public function get_charset_collate()
     {
@@ -429,6 +584,11 @@ class FakeWpdb
     public function get_col($sql)
     {
         $this->queries[] = $sql;
+        if (!empty($this->get_col_returns) && isset($this->get_col_returns[$this->get_col_index])) {
+            $result = $this->get_col_returns[$this->get_col_index];
+            $this->get_col_index++;
+            return $result;
+        }
         return [];
     }
 

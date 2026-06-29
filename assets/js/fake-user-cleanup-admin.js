@@ -116,7 +116,7 @@ jQuery(document).ready(function($) {
                 'Start dry run cleanup? No users will be deleted.' : 
                 'Are you sure you want to delete these users? This action cannot be undone!';
             if (forceCleanup && !dryRun) {
-                confirmMsg += '\n\nWARNING: Force cleanup is enabled - some safety checks will be bypassed!';
+                confirmMsg += '\n\nWARNING: Force cleanup is enabled - activity meta checks will be bypassed. Users with orders or authored content are still protected.';
             }
             if (confirm(confirmMsg)) {
                 startCleanup();
@@ -570,7 +570,10 @@ jQuery(document).ready(function($) {
                 dry_run: dryRun ? 1 : 0,
                 force_cleanup: forceCleanup ? 1 : 0,
                 is_new_cleanup: isNewCleanup ? 1 : 0,
-                delay_after_delete_ms: parseInt($('#cleanup-delay-ms').val(), 10) || 0
+                delay_after_delete_ms: parseInt($('#cleanup-delay-ms').val(), 10) || 0,
+                activity_grace_months: parseInt($('#activity-grace-months').val(), 10)
+                    || (window.intersoccerCleanup.defaults && window.intersoccerCleanup.defaults.activityGraceMonths)
+                    || 6
             },
             success: function(response) {
                 if (response.success) {

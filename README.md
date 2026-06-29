@@ -63,12 +63,13 @@ Enterprise-grade tooling for identifying and removing large volumes of bot-creat
    - **Detailed logging** is off by default; enable only when troubleshooting.
 
 3. **Cleanup**  
-   - Cleanup runs in **batches** (N users per request); batch size, per-delete delay, and inter-batch delay are configurable.  
+   - Cleanup runs in **batches** (N users per request); batch size, per-delete delay, inter-batch delay, and **activity grace period** are configurable.  
+   - **Activity grace period (months):** timestamp-based activity meta (`wc_last_active`, `last_login`, `wp_last_login`, `last_activity`) only blocks deletion when activity is within the last N months. Default `6`. Use `0` for strict mode. `session_tokens` always blocks.  
    - Run in **Dry Run** mode first to collect flags (no deletions).  
    - `Needs Review` counters surface users with suspicious activity — use the **Download Review CSV** button to inspect them.  
    - When satisfied, uncheck dry run and rerun cleanup.  
    - Smaller batch sizes (e.g. 25, default) and "Delay after each delete" reduce load on the database.  
-   - `Force cleanup` bypasses safety net checks (use with caution).
+   - `Force cleanup` bypasses activity meta checks only (including `session_tokens` and grace period). Users with WooCommerce orders or authored content are always protected.
 
 4. **Logging**  
    - Batch-level JSON entries are written only when **Detailed logging** is enabled (or when using WP-CLI).  
@@ -99,6 +100,7 @@ wp intersoccer fake-users scan \
 wp intersoccer fake-users cleanup \
     [--batch-size=25] \
     [--delay-ms=0] \
+    [--activity-grace-months=6] \
     [--dry-run] \
     [--force] \
     [--resume] \
@@ -106,8 +108,9 @@ wp intersoccer fake-users cleanup \
 ```
 - `--batch-size`: users per batch (default 25 for low impact).  
 - `--delay-ms`: milliseconds to wait after each delete (e.g. 25) to reduce DB contention; 0 = disabled.  
+- `--activity-grace-months`: only block cleanup for timestamp-based activity within this many months (default 6; 0 = strict).  
 - `--dry-run`: run in verification mode only (default safety posture).  
-- `--force`: delete even if safety flags (orders/posts/activity) exist.
+- `--force`: bypass activity meta checks only (`recent_activity_meta`, including `session_tokens`; grace period ignored). Never bypasses `customer_has_orders` or `authored_content`.
 
 Logs, scores, and review counts are emitted to the CLI output and JSON log simultaneously.
 
@@ -169,6 +172,9 @@ You can tune detection without editing the plugin:
 - **`intersoccer_fake_cleanup_add_users_index`**  
   (bool) When `true`, activation attempts to add `intersoccer_registered_id (user_registered, ID)` on `wp_users`. Default `false`; many shared hosts restrict ALTER on core tables.
 
+- **`intersoccer_fake_cleanup_activity_grace_months`**  
+  (int) Months of recent timestamp-based activity that block cleanup (`wc_last_active`, `last_login`, `wp_last_login`, `last_activity`). Default `6`. Use `0` for strict mode (any non-empty value blocks). `session_tokens` always blocks regardless of this setting.
+
 ---
 
 ## Performance (shared hosting)
@@ -184,13 +190,14 @@ The scan phase prefetches usermeta and registration cohorts once per session, th
 | Cleanup batch size | 10–25 |
 | Cleanup inter-batch delay | 2000 ms |
 | Per-delete delay | 25–50 ms |
+| Activity grace period | 6 months (use 0 for strict) |
 | Detailed logging | Off unless debugging |
 
 **Off-peak alternative:** run via WP-CLI over SSH to avoid competing with web PHP workers:
 
 ```bash
 wp intersoccer fake-users scan --start-date=2025-07-01 --end-date=2025-08-25 --batch-size=50
-wp intersoccer fake-users cleanup --batch-size=10 --delay-ms=25 --dry-run
+wp intersoccer fake-users cleanup --batch-size=10 --delay-ms=25 --activity-grace-months=6 --dry-run
 ```
 
 ---
