@@ -10,6 +10,8 @@ class InterSoccerFakeUserCleanupTest extends TestCase
         $GLOBALS['mock_dbdelta'] = [];
         $GLOBALS['mock_options'] = [];
         $GLOBALS['mock_transients'] = [];
+        $GLOBALS['mock_deleted_users'] = [];
+        unset($GLOBALS['mock_wp_delete_user_return']);
     }
 
     public function testEnsureTempTableCreatesTableWithBigint()
@@ -351,14 +353,54 @@ class InterSoccerFakeUserCleanupTest extends TestCase
         $this->assertSame('wc_last_active', $flag['detail']);
     }
 
-    public function testBuildActivityMetaFlagAlwaysBlocksSessionTokens()
+    public function testBuildActivityMetaFlagEmptySessionTokensDoesNotBlock()
     {
         $instance = new InterSoccer_Fake_User_Cleanup();
         $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
             'session_tokens',
-            'a:1:{s:64:"token";}',
+            'a:0:{}',
             6
         ]);
+        $this->assertNull($flag);
+
+        $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
+            'session_tokens',
+            [],
+            6
+        ]);
+        $this->assertNull($flag);
+    }
+
+    public function testBuildActivityMetaFlagExpiredSessionTokensDoesNotBlock()
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
+            'session_tokens',
+            [
+                'deadbeef' => [
+                    'expiration' => time() - 3600,
+                    'login' => time() - 7200,
+                ],
+            ],
+            6
+        ]);
+        $this->assertNull($flag);
+    }
+
+    public function testBuildActivityMetaFlagActiveSessionTokensBlocks()
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $flag = $this->invokePrivateMethod($instance, 'build_activity_meta_flag', [
+            'session_tokens',
+            [
+                'alivebeef' => [
+                    'expiration' => time() + 3600,
+                    'login' => time(),
+                ],
+            ],
+            6
+        ]);
+        $this->assertIsArray($flag);
         $this->assertSame('recent_activity_meta', $flag['code']);
         $this->assertSame('session_tokens', $flag['detail']);
     }
@@ -465,6 +507,159 @@ class InterSoccerFakeUserCleanupTest extends TestCase
         $this->assertTrue($this->containsQuery($wpdb->queries, 'wp_usermeta'));
     }
 
+    public function testProcessCleanupBatchDryRunIncrementsWouldDeleteAndKeepsTemp()
+    {
+        global $wpdb, $mock_options;
+        $mock_options['intersoccer_fake_cleanup_schema_version'] = 4;
+        $wpdb = $this->createCleanupBatchWpdb(
+            [(object) ['id' => 10, 'email' => 'fake10@example.com']],
+            [],
+            []
+        );
+
+        $instance = $this->createCleanupInstanceWithTempLog();
+        $result = $this->invokePrivateMethod($instance, 'process_cleanup_batch', [
+            'cleanup-dry',
+            [
+                'batch_size' => 25,
+                'dry_run' => true,
+                'force_cleanup' => false,
+                'is_new_cleanup' => true,
+            ],
+        ]);
+
+        $this->assertSame(1, $result['progress']['would_delete']);
+        $this->assertSame(0, $result['progress']['deleted']);
+        $this->assertFalse($this->containsQuery($wpdb->queries, 'DELETE FROM wp_intersoccer_temp_fake_users'));
+        $this->assertEmpty($GLOBALS['mock_deleted_users'] ?? []);
+    }
+
+    public function testProcessCleanupBatchSuccessfulDeleteRemovesTempAndAudits()
+    {
+        global $wpdb, $mock_options;
+        $mock_options['intersoccer_fake_cleanup_schema_version'] = 4;
+        $GLOBALS['mock_deleted_users'] = [];
+        unset($GLOBALS['mock_wp_delete_user_return']);
+
+        $wpdb = $this->createCleanupBatchWpdb(
+            [(object) ['id' => 11, 'email' => 'fake11@example.com']],
+            [],
+            []
+        );
+
+        $instance = $this->createCleanupInstanceWithTempLog();
+        $result = $this->invokePrivateMethod($instance, 'process_cleanup_batch', [
+            'cleanup-ok',
+            [
+                'batch_size' => 25,
+                'dry_run' => false,
+                'force_cleanup' => false,
+                'is_new_cleanup' => true,
+            ],
+        ]);
+
+        $this->assertSame(1, $result['progress']['deleted']);
+        $this->assertSame(0, $result['progress']['would_delete']);
+        $this->assertSame(0, $result['progress']['delete_failed']);
+        $this->assertSame([11], $GLOBALS['mock_deleted_users']);
+        $this->assertTrue($this->containsQuery($wpdb->queries, 'DELETE FROM wp_intersoccer_temp_fake_users'));
+        $this->assertTrue($this->containsQuery($wpdb->queries, 'INSERT INTO wp_intersoccer_cleanup_audit'));
+    }
+
+    public function testProcessCleanupBatchFailedDeleteKeepsTempAndIncrementsDeleteFailed()
+    {
+        global $wpdb, $mock_options;
+        $mock_options['intersoccer_fake_cleanup_schema_version'] = 4;
+        $GLOBALS['mock_deleted_users'] = [];
+        $GLOBALS['mock_wp_delete_user_return'] = false;
+
+        $wpdb = $this->createCleanupBatchWpdb(
+            [(object) ['id' => 12, 'email' => 'fake12@example.com']],
+            [],
+            []
+        );
+
+        $instance = $this->createCleanupInstanceWithTempLog();
+        $result = $this->invokePrivateMethod($instance, 'process_cleanup_batch', [
+            'cleanup-fail',
+            [
+                'batch_size' => 25,
+                'dry_run' => false,
+                'force_cleanup' => false,
+                'is_new_cleanup' => true,
+            ],
+        ]);
+
+        $this->assertSame(0, $result['progress']['deleted']);
+        $this->assertSame(1, $result['progress']['delete_failed']);
+        $this->assertSame(1, $result['progress']['skipped']);
+        $this->assertEmpty($GLOBALS['mock_deleted_users']);
+        $this->assertFalse($this->containsQuery($wpdb->queries, 'DELETE FROM wp_intersoccer_temp_fake_users'));
+        unset($GLOBALS['mock_wp_delete_user_return']);
+    }
+
+    public function testProcessCleanupBatchSafetySkipKeepsTempRow()
+    {
+        global $wpdb, $mock_options;
+        $mock_options['intersoccer_fake_cleanup_schema_version'] = 4;
+        $GLOBALS['mock_deleted_users'] = [];
+        unset($GLOBALS['mock_wp_delete_user_return']);
+
+        $wpdb = $this->createCleanupBatchWpdb(
+            [(object) ['id' => 13, 'email' => 'real13@example.com']],
+            ['13'],
+            []
+        );
+
+        $instance = $this->createCleanupInstanceWithTempLog();
+        $result = $this->invokePrivateMethod($instance, 'process_cleanup_batch', [
+            'cleanup-review',
+            [
+                'batch_size' => 25,
+                'dry_run' => false,
+                'force_cleanup' => false,
+                'is_new_cleanup' => true,
+            ],
+        ]);
+
+        $this->assertSame(1, $result['progress']['reviewed']);
+        $this->assertSame(0, $result['progress']['deleted']);
+        $this->assertCount(1, $result['review_users']);
+        $this->assertSame('customer_has_orders', $result['review_users'][0]['reasons'][0]['code']);
+        $this->assertNotEmpty($wpdb->update_calls);
+        $this->assertFalse($this->containsQuery($wpdb->queries, 'DELETE FROM wp_intersoccer_temp_fake_users'));
+        $this->assertEmpty($GLOBALS['mock_deleted_users']);
+    }
+
+    /**
+     * @param object[] $fakeUsers
+     * @param array $orderUserIds
+     * @param array $authorIds
+     */
+    private function createCleanupBatchWpdb(array $fakeUsers, array $orderUserIds, array $authorIds): FakeWpdb
+    {
+        $wpdb = new FakeWpdb();
+        $wpdb->prefix = 'wp_';
+        $wpdb->get_var_returns = [count($fakeUsers)];
+        $regRows = array_map(static function ($u) {
+            return (object) ['ID' => $u->id, 'user_registered' => '2025-07-01 12:00:00'];
+        }, $fakeUsers);
+        // Order: fake-user batch, activity usermeta (when force off), then registered map.
+        $wpdb->get_results_returns = [$fakeUsers, [], $regRows];
+        $wpdb->get_col_returns = [$orderUserIds, $authorIds];
+        return $wpdb;
+    }
+
+    private function createCleanupInstanceWithTempLog(): InterSoccer_Fake_User_Cleanup
+    {
+        $instance = new InterSoccer_Fake_User_Cleanup();
+        $reflection = new ReflectionClass($instance);
+        $prop = $reflection->getProperty('log_file');
+        $prop->setAccessible(true);
+        $prop->setValue($instance, sys_get_temp_dir() . '/intersoccer-cleanup-test.log');
+        return $instance;
+    }
+
     private function containsQuery(array $queries, string $expected): bool
     {
         foreach ($queries as $query) {
@@ -496,6 +691,7 @@ class FakeWpdb
     public $indexes = [];
     public $queries = [];
     public $replace_calls = [];
+    public $update_calls = [];
     public $last_error = '';
     /** @var array Optional ordered return values for get_var() when not SHOW TABLES/FIELDS */
     public $get_var_returns = [];
@@ -602,5 +798,11 @@ class FakeWpdb
     {
         $this->replace_calls[] = array($table, $data);
         return true;
+    }
+
+    public function update($table, $data, $where, $format = null, $where_format = null)
+    {
+        $this->update_calls[] = array($table, $data, $where);
+        return 1;
     }
 }

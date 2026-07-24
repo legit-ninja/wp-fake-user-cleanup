@@ -2,7 +2,7 @@
 /**
  * Plugin Name: InterSoccer Fake User Cleanup
  * Description: Fixed cleanup tool with proper validation logic
- * Version: 1.6.28
+ * Version: 1.7.24
  * Author: Jeremy Lee
  */
 
@@ -288,12 +288,14 @@ class InterSoccer_Fake_User_Cleanup {
         if (!isset($_GET['page']) || $_GET['page'] !== 'enhanced-fake-user-cleanup') {
             return;
         }
+        $script_path = plugin_dir_path(__FILE__) . 'assets/js/fake-user-cleanup-admin.js';
         $script_url = plugin_dir_url(__FILE__) . 'assets/js/fake-user-cleanup-admin.js';
+        $script_ver = file_exists($script_path) ? (string) filemtime($script_path) : '1.7.24';
         wp_enqueue_script(
             'intersoccer-fake-user-cleanup-admin',
             $script_url,
             array('jquery'),
-            '1.6.28',
+            $script_ver,
             true
         );
         wp_localize_script('intersoccer-fake-user-cleanup-admin', 'intersoccerCleanup', array(
@@ -405,6 +407,9 @@ class InterSoccer_Fake_User_Cleanup {
                 <h2>Step 2: Review and Cleanup</h2>
                 <p><strong>Warning:</strong> This action cannot be undone.</p>
                 
+                <div id="dry-run-notice" class="notice notice-warning inline" style="margin: 0 0 12px; padding: 8px 12px;">
+                    <p style="margin: 0;"><strong>Dry Run is ON.</strong> No users will be deleted. Uncheck Dry Run below before a real cleanup.</p>
+                </div>
                 <div class="cleanup-options">
                     <label><input type="checkbox" id="dry-run" checked> Dry Run (Log only, no deletion)</label>
                     <label><input type="checkbox" id="force-cleanup"> Force cleanup (bypass activity meta checks only; orders and authored content always protected)</label>
@@ -430,9 +435,9 @@ class InterSoccer_Fake_User_Cleanup {
                         <input type="number" id="activity-grace-months" min="0" max="120" value="6" style="width: 4em;">
                     </label>
                 </div>
-                <p class="description" style="margin-top: 0;">Users with timestamp-based activity older than this grace period are eligible for deletion. Use 0 for strict mode (any activity meta blocks). <code>session_tokens</code> always blocks.</p>
+                <p class="description" style="margin-top: 0;">Users with timestamp-based activity older than this grace period are eligible for deletion. Use 0 for strict mode (any activity meta blocks). Only <strong>active</strong> <code>session_tokens</code> (non-expired) block; empty or fully expired sessions do not.</p>
                 
-                <button id="cleanup-users" class="button button-secondary">Start Cleanup</button>
+                <button id="cleanup-users" class="button button-secondary">Start Dry Run Cleanup</button>
                 <button id="resume-cleanup" class="button button-secondary" style="display: none;">Resume Cleanup</button>
                 <button id="reset-cleanup" class="button button-link" style="display: none;">Reset Cleanup</button>
                 <button id="download-review" class="button" style="display: none;">Download Review CSV</button>
@@ -918,14 +923,16 @@ class InterSoccer_Fake_User_Cleanup {
         if ($is_new_cleanup) {
             $total_fake_users = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}{$this->temp_table}");
 
-                $cleanup_progress = array(
+            $cleanup_progress = array(
                 'session_id' => $session_id,
                 'status' => 'running',
                 'processed' => 0,
                 'total_users' => $total_fake_users,
                 'deleted' => 0,
+                'would_delete' => 0,
                 'skipped' => 0,
-                    'reviewed' => 0,
+                'reviewed' => 0,
+                'delete_failed' => 0,
                 'last_id' => 0,
                 'start_time' => time(),
                 'dry_run' => $dry_run ? 1 : 0,
@@ -944,6 +951,12 @@ class InterSoccer_Fake_User_Cleanup {
             if (!isset($cleanup_progress['reviewed'])) {
                 $cleanup_progress['reviewed'] = 0;
             }
+            if (!isset($cleanup_progress['would_delete'])) {
+                $cleanup_progress['would_delete'] = 0;
+            }
+            if (!isset($cleanup_progress['delete_failed'])) {
+                $cleanup_progress['delete_failed'] = 0;
+            }
             $dry_run = isset($cleanup_progress['dry_run']) ? (bool) $cleanup_progress['dry_run'] : $dry_run;
             $force_cleanup = isset($cleanup_progress['force_cleanup']) ? (bool) $cleanup_progress['force_cleanup'] : $force_cleanup;
             $delay_after_delete_ms = isset($cleanup_progress['delay_after_delete_ms']) ? (int) $cleanup_progress['delay_after_delete_ms'] : 0;
@@ -961,9 +974,11 @@ class InterSoccer_Fake_User_Cleanup {
         ));
 
         $deleted = 0;
+        $would_delete = 0;
         $skipped = 0;
         $reviewed = 0;
-        $processed_ids = array();
+        $delete_failed = 0;
+        $deleted_ids = array();
         $review_users = array();
         $audit_rows = array();
 
@@ -986,6 +1001,13 @@ class InterSoccer_Fake_User_Cleanup {
             ));
             foreach ($reg_rows as $r) {
                 $registered_map[(int) $r->ID] = $r->user_registered;
+            }
+        }
+
+        if (!$dry_run && !function_exists('wp_delete_user')) {
+            $user_admin = ABSPATH . 'wp-admin/includes/user.php';
+            if (is_readable($user_admin)) {
+                require_once $user_admin;
             }
         }
 
@@ -1020,31 +1042,42 @@ class InterSoccer_Fake_User_Cleanup {
                 continue;
             }
 
-            $processed_ids[] = $fake_user->id;
+            if ($dry_run) {
+                $would_delete++;
+                continue;
+            }
 
-            if (!$dry_run) {
-                $user_registered = $registered_map[$fake_user->id] ?? null;
+            if (!function_exists('wp_delete_user')) {
+                $delete_failed++;
+                $skipped++;
+                $this->log_message('cleanup_delete_failed', array(
+                    'session_id' => $session_id,
+                    'user_id' => $fake_user->id,
+                    'reason' => 'wp_delete_user_unavailable'
+                ), 'warning');
+                continue;
+            }
 
-                $result = wp_delete_user($fake_user->id);
-                if ($result) {
-                    $deleted++;
-                    $audit_rows[] = array(
-                        'user_id' => $fake_user->id,
-                        'email' => $fake_user->email,
-                        'registered' => $user_registered
-                    );
-                    if ($delay_after_delete_ms > 0) {
-                        usleep($delay_after_delete_ms * 1000);
-                    }
-                } else {
-                    $skipped++;
-                    $this->log_message('cleanup_delete_failed', array(
-                        'session_id' => $session_id,
-                        'user_id' => $fake_user->id
-                    ), 'warning');
+            $user_registered = $registered_map[$fake_user->id] ?? null;
+            $result = wp_delete_user($fake_user->id);
+            if ($result) {
+                $deleted++;
+                $deleted_ids[] = $fake_user->id;
+                $audit_rows[] = array(
+                    'user_id' => $fake_user->id,
+                    'email' => $fake_user->email,
+                    'registered' => $user_registered
+                );
+                if ($delay_after_delete_ms > 0) {
+                    usleep($delay_after_delete_ms * 1000);
                 }
             } else {
-                $deleted++;
+                $delete_failed++;
+                $skipped++;
+                $this->log_message('cleanup_delete_failed', array(
+                    'session_id' => $session_id,
+                    'user_id' => $fake_user->id
+                ), 'warning');
             }
         }
 
@@ -1062,19 +1095,22 @@ class InterSoccer_Fake_User_Cleanup {
             $wpdb->query($wpdb->prepare($sql, $params));
         }
 
-        if (!$dry_run && !empty($processed_ids)) {
-            $placeholders = implode(',', array_fill(0, count($processed_ids), '%d'));
+        // Only remove temp rows for users actually deleted (never on dry-run or failed delete).
+        if (!$dry_run && !empty($deleted_ids)) {
+            $placeholders = implode(',', array_fill(0, count($deleted_ids), '%d'));
             $wpdb->query($wpdb->prepare(
                 "DELETE FROM {$wpdb->prefix}{$this->temp_table} WHERE id IN ($placeholders)",
-                $processed_ids
+                $deleted_ids
             ));
         }
 
         $count_processed = count($fake_users);
         $cleanup_progress['processed'] += $count_processed;
         $cleanup_progress['deleted'] += $deleted;
+        $cleanup_progress['would_delete'] += $would_delete;
         $cleanup_progress['skipped'] += $skipped;
         $cleanup_progress['reviewed'] += $reviewed;
+        $cleanup_progress['delete_failed'] += $delete_failed;
 
         if ($count_processed > 0) {
             $cleanup_progress['last_id'] = end($fake_users)->id;
@@ -1096,8 +1132,10 @@ class InterSoccer_Fake_User_Cleanup {
                 'batch_size' => $batch_size,
                 'batch_users' => $count_processed,
                 'deleted' => $deleted,
+                'would_delete' => $would_delete,
                 'skipped' => $skipped,
                 'reviewed' => $reviewed,
+                'delete_failed' => $delete_failed,
                 'dry_run' => $dry_run ? 1 : 0,
                 'force_cleanup' => $force_cleanup ? 1 : 0,
                 'next_last_id' => $cleanup_progress['last_id']
@@ -1115,9 +1153,16 @@ class InterSoccer_Fake_User_Cleanup {
             'progress' => array(
                 'percent' => $percent,
                 'processed' => $cleanup_progress['processed'],
+                // deleted: users actually removed from WP
                 'deleted' => $cleanup_progress['deleted'],
+                // would_delete: dry-run candidates that passed safety checks
+                'would_delete' => $cleanup_progress['would_delete'],
+                // skipped: needs_review + delete_failed (not deleted)
                 'skipped' => $cleanup_progress['skipped'],
+                // reviewed: flagged for manual review (orders/posts/active sessions)
                 'reviewed' => $cleanup_progress['reviewed'],
+                // delete_failed: wp_delete_user returned false / unavailable
+                'delete_failed' => $cleanup_progress['delete_failed'],
                 'total_users' => $cleanup_progress['total_users'],
                 'memory_mb' => round(memory_get_peak_usage(true) / 1024 / 1024, 2)
             ),
@@ -1439,11 +1484,46 @@ class InterSoccer_Fake_User_Cleanup {
     }
 
     /**
+     * Whether session_tokens meta contains at least one non-expired session.
+     *
+     * @param mixed $meta_value Raw or unserialized session_tokens value.
+     * @return bool
+     */
+    private function session_tokens_has_active($meta_value) {
+        if ($meta_value === null || $meta_value === '' || $meta_value === false) {
+            return false;
+        }
+
+        $tokens = $meta_value;
+        if (is_string($meta_value)) {
+            $tokens = function_exists('maybe_unserialize')
+                ? maybe_unserialize($meta_value)
+                : @unserialize($meta_value);
+        }
+
+        if (!is_array($tokens) || empty($tokens)) {
+            return false;
+        }
+
+        $now = time();
+        foreach ($tokens as $token) {
+            if (!is_array($token)) {
+                continue;
+            }
+            if (isset($token['expiration']) && (int) $token['expiration'] > $now) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * @return array|null Flag array when activity should block deletion, null otherwise.
      */
     private function build_activity_meta_flag($meta_key, $meta_value, $grace_months) {
         if ($meta_key === 'session_tokens') {
-            if (!empty($meta_value)) {
+            if ($this->session_tokens_has_active($meta_value)) {
                 return array('code' => 'recent_activity_meta', 'detail' => $meta_key);
             }
             return null;
@@ -1915,11 +1995,14 @@ class InterSoccer_Fake_User_Cleanup {
 
                 $progress = $result['progress'];
                 \WP_CLI::log(sprintf(
-                    'Processed %d/%d users (deleted: %d, skipped: %d)',
+                    'Processed %d/%d users (deleted: %d, would_delete: %d, skipped: %d, reviewed: %d, delete_failed: %d)',
                     $progress['processed'],
                     $progress['total_users'],
                     $progress['deleted'],
-                    $progress['skipped']
+                    $progress['would_delete'] ?? 0,
+                    $progress['skipped'],
+                    $progress['reviewed'] ?? 0,
+                    $progress['delete_failed'] ?? 0
                 ));
 
                 $is_new_cleanup = false;

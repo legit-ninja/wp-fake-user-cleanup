@@ -175,8 +175,35 @@ if (!function_exists('register_activation_hook')) {
 
 if (!function_exists('wp_delete_user')) {
     function wp_delete_user($user_id) {
+        $user_id = (int) $user_id;
+        if (!isset($GLOBALS['mock_deleted_users'])) {
+            $GLOBALS['mock_deleted_users'] = [];
+        }
+        if (isset($GLOBALS['mock_wp_delete_user_return'])) {
+            $ret = $GLOBALS['mock_wp_delete_user_return'];
+            if (is_callable($ret)) {
+                $ok = (bool) $ret($user_id);
+            } elseif (is_array($ret) && array_key_exists($user_id, $ret)) {
+                $ok = (bool) $ret[$user_id];
+            } else {
+                $ok = (bool) $ret;
+            }
+            if ($ok) {
+                $GLOBALS['mock_deleted_users'][] = $user_id;
+            }
+            return $ok;
+        }
         $GLOBALS['mock_deleted_users'][] = $user_id;
         return true;
+    }
+}
+
+if (!function_exists('wp_mkdir_p')) {
+    function wp_mkdir_p($target) {
+        if (is_dir($target)) {
+            return true;
+        }
+        return @mkdir($target, 0777, true);
     }
 }
 
@@ -221,7 +248,24 @@ if (!function_exists('is_serialized')) {
         if (!is_string($data)) {
             return false;
         }
-        return preg_match('/^[aOs]:\d+:/', $data) === 1;
+        $data = trim($data);
+        if ($data === 'N;') {
+            return true;
+        }
+        if (!preg_match('/^([adObis]):/', $data, $matches)) {
+            return false;
+        }
+        switch ($matches[1]) {
+            case 'a':
+            case 'O':
+            case 's':
+                return (bool) preg_match("/^{$matches[1]}:[0-9]+:.*[;}]\$/s", $data);
+            case 'b':
+            case 'i':
+            case 'd':
+                return (bool) preg_match("/^{$matches[1]}:[0-9.E+-]+;\$/", $data);
+        }
+        return false;
     }
 }
 

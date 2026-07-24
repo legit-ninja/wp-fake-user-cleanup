@@ -3,6 +3,7 @@ jQuery(document).ready(function($) {
     let cleanupInProgress = false;
     let scanSessionId = null;
     let cleanupSessionId = null;
+    let cleanupResumeAvailable = false;
 
     function generateSessionId(prefix) {
         if (window.crypto && window.crypto.randomUUID) {
@@ -123,6 +124,28 @@ jQuery(document).ready(function($) {
             }
         }
     });
+
+    $('#dry-run').on('change click', function() {
+        // Defer so :checked reflects the new state after the click toggles.
+        setTimeout(syncDryRunUi, 0);
+    });
+    syncDryRunUi();
+
+    function idleCleanupButtonLabel() {
+        if (cleanupResumeAvailable) {
+            return 'Resume Cleanup';
+        }
+        return $('#dry-run').is(':checked') ? 'Start Dry Run Cleanup' : 'Start Cleanup';
+    }
+
+    function syncDryRunUi() {
+        const dryRun = $('#dry-run').is(':checked');
+        $('#dry-run-notice').toggle(!!dryRun);
+        if (cleanupInProgress) {
+            return;
+        }
+        $('#cleanup-users').text(idleCleanupButtonLabel());
+    }
 
     $('#download-review').click(function() {
         const downloadUrl = `${window.intersoccerCleanup.ajaxurl}?action=download_cleanup_review&nonce=${window.intersoccerCleanup.nonce}`;
@@ -361,12 +384,13 @@ jQuery(document).ready(function($) {
 
     function startCleanup() {
         cleanupInProgress = true;
-        $('#cleanup-users').prop('disabled', true).text('Starting cleanup...');
+        cleanupResumeAvailable = false;
+        const dryRun = $('#dry-run').is(':checked');
+        $('#cleanup-users').prop('disabled', true).text(dryRun ? 'Starting dry run...' : 'Starting cleanup...');
         $('#cleanup-progress-container').show();
         $('#resume-cleanup, #reset-cleanup').hide();
         $('#download-review').hide();
         const batchSize = parseInt($('#cleanup-batch-size').val());
-        const dryRun = $('#dry-run').is(':checked');
         const forceCleanup = $('#force-cleanup').is(':checked');
         cleanupSessionId = generateSessionId('cleanup');
         processCleanupBatch(batchSize, true, dryRun, forceCleanup);
@@ -422,17 +446,20 @@ jQuery(document).ready(function($) {
             success: function(response) {
                 if (response.success && response.data.incomplete && response.data.session) {
                     cleanupSessionId = response.data.session_id || (response.data.session ? response.data.session.session_id : null);
+                    cleanupResumeAvailable = true;
                     $('#resume-cleanup').show();
                     $('#reset-cleanup').show();
-                    $('#cleanup-users').text('Resume Cleanup');
                     if (response.data.session.reviewed && response.data.session.reviewed > 0) {
                         $('#download-review').show();
                     }
+                    syncDryRunUi();
                     alert('Incomplete cleanup detected. Processed: ' + response.data.session.processed + '/' + response.data.session.total_users);
                 } else {
                     cleanupSessionId = null;
+                    cleanupResumeAvailable = false;
                     $('#resume-cleanup').hide();
                     $('#reset-cleanup').hide();
+                    syncDryRunUi();
                 }
             }
         });
@@ -468,9 +495,10 @@ jQuery(document).ready(function($) {
 
     function resetCleanupUI() {
         cleanupInProgress = false;
-        $('#cleanup-users').prop('disabled', false).text('Start Cleanup');
+        $('#cleanup-users').prop('disabled', false);
         $('#cleanup-progress-container').hide();
         $('#download-review').hide();
+        syncDryRunUi();
         
         // Check if we can resume
         checkIncompleteCleanup();
@@ -556,7 +584,11 @@ jQuery(document).ready(function($) {
     }
 
     function processCleanupBatch(batchSize, isNewCleanup, dryRun, forceCleanup) {
-        $('#cleanup-users').text(isNewCleanup ? 'Processing cleanup...' : 'Processing next cleanup batch...');
+        $('#cleanup-users').text(
+            dryRun
+                ? (isNewCleanup ? 'Processing dry run...' : 'Processing next dry-run batch...')
+                : (isNewCleanup ? 'Processing cleanup...' : 'Processing next cleanup batch...')
+        );
         
         $.ajax({
             url: window.intersoccerCleanup.ajaxurl,
@@ -580,7 +612,7 @@ jQuery(document).ready(function($) {
                     if (response.data.session_id) {
                         cleanupSessionId = response.data.session_id;
                     }
-                    updateCleanupProgress(response.data.progress);
+                    updateCleanupProgress(response.data.progress, response.data.dry_run);
                     
                     if (response.data.completed) {
                         completeCleanup(response.data);
@@ -605,13 +637,25 @@ jQuery(document).ready(function($) {
         });
     }
 
-    function updateCleanupProgress(progress) {
+    function updateCleanupProgress(progress, isDryRun) {
         const percent = Math.round(progress.percent);
         $('#cleanup-progress-fill').css('width', percent + '%');
-        $('#cleanup-progress-text').text(percent + '% complete');
-        let stats = `Processed: ${progress.processed} | Deleted: ${progress.deleted} | Skipped: ${progress.skipped}`;
+        $('#cleanup-progress-text').text(
+            (isDryRun ? 'Dry run — ' : '') + percent + '% complete'
+        );
+        let stats = `Processed: ${progress.processed}`;
+        if (isDryRun || (progress.would_delete && progress.would_delete > 0)) {
+            stats += ` | Would delete: ${progress.would_delete || 0}`;
+        }
+        if (!isDryRun) {
+            stats += ` | Deleted: ${progress.deleted}`;
+        }
+        stats += ` | Skipped: ${progress.skipped}`;
         if (typeof progress.reviewed !== 'undefined' && progress.reviewed !== null) {
             stats += ` | Needs Review: ${progress.reviewed}`;
+        }
+        if (typeof progress.delete_failed !== 'undefined' && progress.delete_failed > 0) {
+            stats += ` | Delete failed: ${progress.delete_failed}`;
         }
         if (typeof progress.total_users !== 'undefined' && progress.total_users !== null) {
             stats += ` | Total: ${progress.total_users}`;
@@ -629,9 +673,39 @@ jQuery(document).ready(function($) {
         cleanupSessionId = null;
         $('#cleanup-users').prop('disabled', false).text('Cleanup Complete');
         $('#cleanup-progress-container').hide();
-        
-        const action = data.dry_run ? 'would be deleted' : 'deleted';
-        alert(`Cleanup completed! ${data.progress.deleted} users ${action}.`);
+
+        const progress = data.progress || {};
+        const parts = [];
+        if (data.dry_run) {
+            parts.push(`${progress.would_delete || 0} users would be deleted`);
+        } else {
+            parts.push(`${progress.deleted || 0} users deleted`);
+        }
+        if (progress.reviewed > 0) {
+            parts.push(`${progress.reviewed} need review`);
+            $('#download-review').show();
+        }
+        if (progress.delete_failed > 0) {
+            parts.push(`${progress.delete_failed} delete failures (kept in queue)`);
+        }
+
+        let flagHint = '';
+        if (data.review_users && data.review_users.length) {
+            const codes = {};
+            data.review_users.forEach(function(user) {
+                (user.reasons || []).forEach(function(reason) {
+                    const code = reason.code || reason;
+                    codes[code] = (codes[code] || 0) + 1;
+                });
+            });
+            const top = Object.keys(codes).sort(function(a, b) { return codes[b] - codes[a]; }).slice(0, 3);
+            if (top.length) {
+                flagHint = '\nTop review flags: ' + top.join(', ') +
+                    (progress.reviewed > 0 ? '\nUse Download Review CSV for the full list.' : '');
+            }
+        }
+
+        alert(`Cleanup completed! ${parts.join('; ')}.${flagHint}`);
         
         // Refresh the page to show updated results
         location.reload();

@@ -64,12 +64,12 @@ Enterprise-grade tooling for identifying and removing large volumes of bot-creat
 
 3. **Cleanup**  
    - Cleanup runs in **batches** (N users per request); batch size, per-delete delay, inter-batch delay, and **activity grace period** are configurable.  
-   - **Activity grace period (months):** timestamp-based activity meta (`wc_last_active`, `last_login`, `wp_last_login`, `last_activity`) only blocks deletion when activity is within the last N months. Default `6`. Use `0` for strict mode. `session_tokens` always blocks.  
+   - **Activity grace period (months):** timestamp-based activity meta (`wc_last_active`, `last_login`, `wp_last_login`, `last_activity`) only blocks deletion when activity is within the last N months. Default `6`. Use `0` for strict mode. Only **active** `session_tokens` (non-expired) block; empty or fully expired sessions do not.  
    - Run in **Dry Run** mode first to collect flags (no deletions).  
    - `Needs Review` counters surface users with suspicious activity — use the **Download Review CSV** button to inspect them.  
    - When satisfied, uncheck dry run and rerun cleanup.  
    - Smaller batch sizes (e.g. 25, default) and "Delay after each delete" reduce load on the database.  
-   - `Force cleanup` bypasses activity meta checks only (including `session_tokens` and grace period). Users with WooCommerce orders or authored content are always protected.
+   - `Force cleanup` bypasses activity meta checks only (including active `session_tokens` and grace period). Users with WooCommerce orders or authored content are always protected.
 
 4. **Logging**  
    - Batch-level JSON entries are written only when **Detailed logging** is enabled (or when using WP-CLI).  
@@ -110,7 +110,7 @@ wp intersoccer fake-users cleanup \
 - `--delay-ms`: milliseconds to wait after each delete (e.g. 25) to reduce DB contention; 0 = disabled.  
 - `--activity-grace-months`: only block cleanup for timestamp-based activity within this many months (default 6; 0 = strict).  
 - `--dry-run`: run in verification mode only (default safety posture).  
-- `--force`: bypass activity meta checks only (`recent_activity_meta`, including `session_tokens`; grace period ignored). Never bypasses `customer_has_orders` or `authored_content`.
+- `--force`: bypass activity meta checks only (`recent_activity_meta`, including active `session_tokens`; grace period ignored). Never bypasses `customer_has_orders` or `authored_content`.
 
 Logs, scores, and review counts are emitted to the CLI output and JSON log simultaneously.
 
@@ -173,7 +173,7 @@ You can tune detection without editing the plugin:
   (bool) When `true`, activation attempts to add `intersoccer_registered_id (user_registered, ID)` on `wp_users`. Default `false`; many shared hosts restrict ALTER on core tables.
 
 - **`intersoccer_fake_cleanup_activity_grace_months`**  
-  (int) Months of recent timestamp-based activity that block cleanup (`wc_last_active`, `last_login`, `wp_last_login`, `last_activity`). Default `6`. Use `0` for strict mode (any non-empty value blocks). `session_tokens` always blocks regardless of this setting.
+  (int) Months of recent timestamp-based activity that block cleanup (`wc_last_active`, `last_login`, `wp_last_login`, `last_activity`). Default `6`. Use `0` for strict mode (any non-empty value blocks). Only active (non-expired) `session_tokens` block regardless of this setting; empty or expired sessions do not.
 
 ---
 
