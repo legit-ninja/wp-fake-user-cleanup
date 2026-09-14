@@ -1059,6 +1059,9 @@ class InterSoccer_Fake_User_Cleanup {
             }
 
             $user_registered = $registered_map[$fake_user->id] ?? null;
+            if ($user_registered === null) {
+                $user_registered = '1970-01-01 00:00:00';
+            }
             $result = wp_delete_user($fake_user->id);
             if ($result) {
                 $deleted++;
@@ -1561,6 +1564,107 @@ class InterSoccer_Fake_User_Cleanup {
         return $this->build_activity_meta_flag($meta_key, $meta_value, $grace_months) !== null;
     }
 
+    /**
+     * Sanitize a value for CSV export to prevent formula injection.
+     * Prefixes values starting with =, +, -, @, tab, or CR with a single quote.
+     *
+     * @param string $value The value to sanitize.
+     * @return string The sanitized value.
+     */
+    private function sanitize_csv_field($value) {
+        if (!is_string($value) || $value === '') {
+            return $value;
+        }
+        $first_char = $value[0];
+        if (in_array($first_char, array('=', '+', '-', '@', "\t", "\r"), true)) {
+            return "'" . $value;
+        }
+        return $value;
+    }
+
+    /**
+     * Check if WooCommerce is using HPOS (High-Performance Order Storage).
+     *
+     * @return bool True if HPOS is enabled, false for legacy storage or no WooCommerce.
+     */
+    private function is_woocommerce_hpos_enabled() {
+        if (!class_exists('Automattic\WooCommerce\Utilities\OrderUtil')) {
+            return false;
+        }
+        return \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled();
+    }
+
+    /**
+     * Check if a single user has WooCommerce orders.
+     * Supports both HPOS and legacy storage.
+     *
+     * @param int $user_id User ID to check.
+     * @return bool True if user has orders.
+     */
+    private function user_has_woocommerce_orders($user_id) {
+        global $wpdb;
+
+        if ($this->is_woocommerce_hpos_enabled()) {
+            $orders_table = $wpdb->prefix . 'wc_orders';
+            if ($wpdb->get_var("SHOW TABLES LIKE '{$orders_table}'") === $orders_table) {
+                $has_order = $wpdb->get_var($wpdb->prepare(
+                    "SELECT 1 FROM {$orders_table} WHERE customer_id = %d LIMIT 1",
+                    $user_id
+                ));
+                return (bool) $has_order;
+            }
+        }
+
+        $has_order = $wpdb->get_var($wpdb->prepare(
+            "SELECT 1
+             FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_customer_user'
+             AND pm.meta_value = %d
+             AND p.post_type IN ('shop_order', 'shop_order_refund')
+             LIMIT 1",
+            $user_id
+        ));
+        return (bool) $has_order;
+    }
+
+    /**
+     * Get user IDs that have WooCommerce orders from a batch.
+     * Supports both HPOS and legacy storage.
+     *
+     * @param int[] $user_ids User IDs to check.
+     * @return int[] User IDs that have orders.
+     */
+    private function get_user_ids_with_woocommerce_orders(array $user_ids) {
+        global $wpdb;
+
+        if (empty($user_ids)) {
+            return array();
+        }
+
+        $placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
+
+        if ($this->is_woocommerce_hpos_enabled()) {
+            $orders_table = $wpdb->prefix . 'wc_orders';
+            if ($wpdb->get_var("SHOW TABLES LIKE '{$orders_table}'") === $orders_table) {
+                return $wpdb->get_col($wpdb->prepare(
+                    "SELECT DISTINCT customer_id FROM {$orders_table} WHERE customer_id IN ($placeholders)",
+                    $user_ids
+                ));
+            }
+        }
+
+        return $wpdb->get_col($wpdb->prepare(
+            "SELECT DISTINCT CAST(pm.meta_value AS UNSIGNED)
+             FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_customer_user'
+             AND pm.meta_value IN ($placeholders)
+             AND p.post_type IN ('shop_order', 'shop_order_refund')",
+            $user_ids
+        ));
+    }
+
     private function get_user_safety_flags($user_id, $grace_months = null, $include_activity_checks = true) {
         global $wpdb;
 
@@ -1572,17 +1676,9 @@ class InterSoccer_Fake_User_Cleanup {
 
         $flags = array();
 
-        // Orders via WooCommerce (postmeta _customer_user)
-        $has_order = $wpdb->get_var($wpdb->prepare(
-            "SELECT 1
-             FROM {$wpdb->posts} p
-             INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
-             WHERE pm.meta_key = '_customer_user'
-             AND pm.meta_value = %d
-             AND p.post_type IN ('shop_order', 'shop_order_refund')
-             LIMIT 1",
-            $user_id
-        ));
+        // Orders via WooCommerce - check for orders belonging to this user
+        // Supports both HPOS (wc_orders table) and legacy (posts/postmeta) storage
+        $has_order = $this->user_has_woocommerce_orders($user_id);
         if ($has_order) {
             $flags[] = array('code' => 'customer_has_orders');
         }
@@ -1638,15 +1734,8 @@ class InterSoccer_Fake_User_Cleanup {
         $placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
 
         // Orders: user IDs that have WooCommerce orders
-        $order_user_ids = $wpdb->get_col($wpdb->prepare(
-            "SELECT DISTINCT CAST(pm.meta_value AS UNSIGNED)
-             FROM {$wpdb->posts} p
-             INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
-             WHERE pm.meta_key = '_customer_user'
-             AND pm.meta_value IN ($placeholders)
-             AND p.post_type IN ('shop_order', 'shop_order_refund')",
-            $user_ids
-        ));
+        // Supports both HPOS (wc_orders table) and legacy (posts/postmeta) storage
+        $order_user_ids = $this->get_user_ids_with_woocommerce_orders($user_ids);
         if ($order_user_ids) {
             foreach ($order_user_ids as $uid) {
                 $uid = (int) $uid;
@@ -1869,10 +1958,10 @@ class InterSoccer_Fake_User_Cleanup {
 
             fputcsv($output, array(
                 $row['id'],
-                $row['email'],
+                $this->sanitize_csv_field($row['email']),
                 $row['score'],
                 $row['registered'],
-                implode('; ', $flags)
+                $this->sanitize_csv_field(implode('; ', $flags))
             ));
         }
 
