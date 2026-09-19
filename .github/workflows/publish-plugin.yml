@@ -1,0 +1,52 @@
+# Thin caller: publish Fake User Cleanup ZIP to Underdog Unlimited via shared reusable workflow.
+#
+# GitHub Environments: production (stable releases) | staging (prereleases + workflow_dispatch)
+#
+# Secrets (per environment):
+#   UU_PUBLISH_TOKEN — same value as PLUGIN_PUBLISH_TOKEN on the Underdog server
+# Variables (repository or environment):
+#   UU_PUBLISH_URL — override base URL (reusable defaults to https://plugins.underdogunlimited.com)
+
+name: Publish plugin to Underdog
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish to staging (e.g. 2.7.20-rc3 or v2.7.20-rc3)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Guard production release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.release.prerelease == false
+    steps:
+      - name: Ensure target is main or master
+        run: |
+          TARGET="${{ github.event.release.target_commitish }}"
+          if [[ "$TARGET" != "main" && "$TARGET" != "master" ]]; then
+            echo "::error::Production publishes must target main (got: $TARGET)"
+            exit 1
+          fi
+
+  publish:
+    name: Publish via shared workflow
+    needs: [guard]
+    if: always() && (needs.guard.result == 'success' || needs.guard.result == 'skipped')
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'staging' || (github.event.release.prerelease && 'staging' || 'production') }}
+    uses: legit-ninja/intersoccer-ci/.github/workflows/publish-plugin.yml@main
+    with:
+      plugin_slug: fake-user-cleanup
+      bootstrap_php: fake-user-cleanup.php
+      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+      changelog: ${{ github.event.release.body || '' }}
+      publish_url: ${{ vars.UU_PUBLISH_URL }}
+    secrets:
+      UU_PUBLISH_TOKEN: ${{ secrets.UU_PUBLISH_TOKEN }}
