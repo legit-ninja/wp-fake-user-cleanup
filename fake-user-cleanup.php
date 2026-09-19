@@ -4,6 +4,7 @@
  * Description: Fixed cleanup tool with proper validation logic
  * Version: 1.7.25
  * Author: Jeremy Lee
+ * Update URI: https://plugins.underdogunlimited.com
  */
 
 // Prevent direct access
