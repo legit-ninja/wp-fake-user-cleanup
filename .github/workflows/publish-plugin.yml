@@ -6,6 +6,10 @@
 #   UU_PUBLISH_TOKEN — same value as PLUGIN_PUBLISH_TOKEN on the Underdog server
 # Variables (repository or environment):
 #   UU_PUBLISH_URL — override base URL (reusable defaults to https://plugins.underdogunlimited.com)
+#
+# Note: GitHub Actions does not allow dynamic `environment:` expressions on jobs with `uses:`
+# (reusable workflow calls). This workflow uses separate jobs for staging and production with
+# static environment names (literal strings), and a guard job to enforce the production constraint.
 
 name: Publish plugin to Underdog
 
@@ -23,7 +27,23 @@ permissions:
   contents: read
 
 jobs:
-  guard:
+  # Staging: triggered by workflow_dispatch OR prerelease
+  publish-staging:
+    name: Publish to staging
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && github.event.release.prerelease == true)
+    environment: staging
+    uses: legit-ninja/intersoccer-ci/.github/workflows/publish-plugin.yml@main
+    with:
+      plugin_slug: fake-user-cleanup
+      bootstrap_php: fake-user-cleanup.php
+      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+      changelog: ${{ github.event.release.body || '' }}
+      publish_url: ${{ vars.UU_PUBLISH_URL }}
+    secrets:
+      UU_PUBLISH_TOKEN: ${{ secrets.UU_PUBLISH_TOKEN }}
+
+  # Production guard: ensures target is main or master before production publish
+  guard-production:
     name: Guard production release
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.release.prerelease == false
@@ -36,16 +56,17 @@ jobs:
             exit 1
           fi
 
-  publish:
-    name: Publish via shared workflow
-    needs: [guard]
-    if: always() && (needs.guard.result == 'success' || needs.guard.result == 'skipped')
-    environment: ${{ github.event_name == 'workflow_dispatch' && 'staging' || (github.event.release.prerelease && 'staging' || 'production') }}
+  # Production: triggered by stable release (not prerelease), after guard passes
+  publish-production:
+    name: Publish to production
+    needs: [guard-production]
+    if: github.event_name == 'release' && github.event.release.prerelease == false
+    environment: production
     uses: legit-ninja/intersoccer-ci/.github/workflows/publish-plugin.yml@main
     with:
       plugin_slug: fake-user-cleanup
       bootstrap_php: fake-user-cleanup.php
-      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+      version: ${{ github.ref_name }}
       changelog: ${{ github.event.release.body || '' }}
       publish_url: ${{ vars.UU_PUBLISH_URL }}
     secrets:
