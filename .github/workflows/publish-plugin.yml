@@ -5,8 +5,7 @@
 #
 # Secrets (per environment):
 #   UU_PUBLISH_TOKEN — same value as PLUGIN_PUBLISH_TOKEN on the Underdog server
-# Variables (repository or environment):
-#   UU_PUBLISH_URL — override base URL (reusable defaults to https://plugins.underdogunlimited.com)
+#   UU_PUBLISH_URL — publish base URL (https only); a secret, not a variable, so it stays masked in logs
 
 name: Publish plugin to Underdog
 
@@ -41,13 +40,13 @@ jobs:
     name: Publish via shared workflow
     needs: [guard]
     if: always() && (needs.guard.result == 'success' || needs.guard.result == 'skipped')
-    uses: legit-ninja/intersoccer-ci/.github/workflows/publish-plugin.yml@main
+    uses: legit-ninja/intersoccer-ci/.github/workflows/publish-plugin.yml@833aad022c993195ba99429f89cfff69d9a268e0 # intersoccer-ci branch ci/publish-url-secret-20261030 (pre-merge); bump to the merge SHA after that PR merges
     with:
       plugin_slug: fake-user-cleanup
       bootstrap_php: fake-user-cleanup.php
       version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
       changelog: ${{ github.event.release.body || '' }}
-      publish_url: ${{ vars.UU_PUBLISH_URL }}
       target_environment: ${{ github.event_name == 'workflow_dispatch' && 'staging' || (github.event.release.prerelease && 'staging' || 'production') }}
     secrets:
       UU_PUBLISH_TOKEN: ${{ secrets.UU_PUBLISH_TOKEN }}
+      UU_PUBLISH_URL: ${{ secrets.UU_PUBLISH_URL }}
